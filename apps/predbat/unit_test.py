@@ -357,6 +357,7 @@ from tests.test_plan_why_reason import run_test_plan_why_reason
 from tests.test_plan_scenarios import run_test_plan_scenarios
 from tests.test_plan_scenario_summary import run_test_plan_scenario_summary
 from tests.test_rate_replicate_missing_slots import test_rate_replicate
+from tests.test_rate_history_average import test_rate_history_average
 from tests.test_find_charge_window import test_find_charge_window
 from tests.test_fetch_pv_mid_cycle import test_fetch_pv_mid_cycle
 from tests.test_fetch_no_load_source import test_fetch_no_load_source
@@ -786,6 +787,7 @@ def main():
         ("dispatch_timeline", run_dispatch_timeline_tests, "Dispatch timeline diagnostic tests (#4516 Stage 1)", False),
         ("log_rotation", run_log_rotation_tests, "Configurable log rotation and two-digit naming (#5076)", False),
         ("rate_replicate", test_rate_replicate, "Rate replicate comprehensive tests (missing slots, IO, offsets, gas)", False),
+        ("rate_history_average", test_rate_history_average, "Historical-mean fallback for rate_replicate", False),
         ("find_charge_window", test_find_charge_window, "Find charge window gap handling tests", False),
         ("fetch_pv_mid_cycle", test_fetch_pv_mid_cycle, "PV forecasts not empty part way through fetch_sensor_data (#4317)", False),
         ("fetch_no_load_source", test_fetch_no_load_source, "No load source raises LoadSourceMissing with the right status (#5092)", False),
