@@ -262,6 +262,7 @@ from tests.test_plan_json_rate_adjust import run_test_plan_json_rate_adjust
 from tests.test_plan_why_reason import run_test_plan_why_reason
 from tests.test_plan_scenario_summary import run_test_plan_scenario_summary
 from tests.test_rate_replicate_missing_slots import test_rate_replicate
+from tests.test_rate_history_average import test_rate_history_average
 from tests.test_find_charge_window import test_find_charge_window
 from tests.test_random_scenarios import generate_scenarios, save_scenarios, run_scenarios_from_file, compare_results, profile_scenario, run_random_scenario_tests
 from tests.test_carbon import test_carbon
@@ -576,6 +577,7 @@ def main():
         ("dispatch_timeline", run_dispatch_timeline_tests, "Dispatch timeline diagnostic tests (#4516 Stage 1)", False),
         ("log_rotation", run_log_rotation_tests, "Configurable log rotation and two-digit naming (#5076)", False),
         ("rate_replicate", test_rate_replicate, "Rate replicate comprehensive tests (missing slots, IO, offsets, gas)", False),
+        ("rate_history_average", test_rate_history_average, "Historical-mean fallback for rate_replicate", False),
         ("find_charge_window", test_find_charge_window, "Find charge window gap handling tests", False),
         ("find_charge_rate", test_find_charge_rate, "Find charge rate tests", False),
         ("find_charge_rate_pv", test_find_charge_rate_pv_overlap, "Find charge rate with PV overlap", False),
