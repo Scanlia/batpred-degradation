@@ -96,6 +96,7 @@ class Prediction:
     def __init__(self, base=None, pv_forecast_minute_step=None, pv_forecast_minute10_step=None, load_minutes_step=None, load_minutes_step10=None, soc_kw=None, soc_max=None):
         global PRED_GLOBAL
         if base:
+            self.base = base
             self.minutes_now = base.minutes_now
             self.log = base.log
             self.time_abs_str = base.time_abs_str
@@ -445,6 +446,7 @@ class Prediction:
         predict_export = {}
         predict_battery_power = {}
         predict_battery_cycle = {}
+        self.predict_degradation_multiplier = {}
         predict_soc_time = {}
         predict_car_soc_time = [{} for car_n in range(self.num_cars)]
         predict_pv_power = {}
@@ -470,6 +472,12 @@ class Prediction:
         import_kwh_battery = 0
         carbon_g = self.carbon_today_sofar
         battery_cycle = 0
+        degradation_weighted_cycle = 0
+        degradation_enable = (
+            hasattr(self, "base")
+            and self.base is not None
+            and getattr(self.base, "degradation_enable", False)
+        )
         metric_keep = 0
         four_hour_rule = True
         final_export_kwh = export_kwh
@@ -480,6 +488,7 @@ class Prediction:
         final_import_kwh_house = import_kwh_house
         final_import_kwh_battery = import_kwh_battery
         final_battery_cycle = battery_cycle
+        final_degradation_weighted_cycle = degradation_weighted_cycle
         final_metric_keep = metric_keep
         final_carbon_g = carbon_g
         metric = self.cost_today_sofar
@@ -1134,6 +1143,20 @@ class Prediction:
             # Count battery cycles
             battery_cycle = battery_cycle + abs(battery_draw)
 
+            # Degradation-weighted cycle counting
+            if degradation_enable:
+                degradation_multiplier = 1.0
+                if hasattr(self, "base") and self.base is not None and hasattr(self.base, "degradation_model") and self.base.degradation_model:
+                    degradation_multiplier = self.base.degradation_model.compute_step_degradation_multiplier(
+                        temp_c=battery_temperature,
+                        soc_percent=(soc / soc_max * 100.0) if soc_max > 0 else 50.0,
+                        delta_throughput_kwh=abs(battery_draw),
+                        delta_time_hours=step / 60.0,
+                        is_charging=(battery_draw < 0),
+                    )
+                degradation_weighted_cycle += abs(battery_draw) * degradation_multiplier
+                self.predict_degradation_multiplier[minute_absolute] = degradation_multiplier
+
             # Work out left over energy after battery adjustment
             diff = get_diff(battery_draw, pv_dc, pv_ac, load_yesterday, inverter_loss, inverter_loss_recp)
 
@@ -1258,6 +1281,7 @@ class Prediction:
             self.final_pv_kwh = round(final_pv_kwh, 4)
             self.final_iboost_kwh = round(final_iboost_kwh, 4)
             self.final_battery_cycle = round(final_battery_cycle, 4)
+            self.final_degradation_weighted_cycle = round(degradation_weighted_cycle, 4)
             self.final_soc_min = round(soc_min, 4)
             self.final_soc_min_minute = soc_min_minute
             self.export_to_first_charge = export_to_first_charge

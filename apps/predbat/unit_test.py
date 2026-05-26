@@ -184,6 +184,7 @@ from tests.test_clip_export_slots import run_clip_export_slots_tests
 from tests.test_clip_charge_slots import run_clip_charge_slots_tests
 from tests.test_discard_unused_charge_slots import run_discard_unused_charge_slots_tests
 from tests.test_discard_unused_export_slots import run_discard_unused_export_slots_tests
+from tests.test_degradation import run_degradation_tests
 from tests.test_marginal_costs import test_marginal_costs
 from tests.test_savings_stability import test_savings_stability
 from tests.test_calculate_yesterday import test_calculate_yesterday
@@ -460,6 +461,7 @@ def main():
         ("plan_tiebreak", run_plan_tiebreak_tests, "Plan fragmentation near-tie tie-break tests", False),
         ("plan_preclip", run_plan_preclip_tests, "Plan selection scores the pre-clip plan", True),
         ("export_commitment", run_export_commitment_tests, "Forced-export commitment / anti-flapping tests", False),
+        ("degradation", run_degradation_tests, "Degradation model tests", False),
         ("load_ml", test_load_ml, "ML Load Forecaster tests (MLP, training, persistence, validation)", True),
         # ("optimise_windows", run_optimise_all_windows_tests, "Optimise all windows tests", True),
         ("optimise_windows_kernel", run_optimise_all_windows_kernel_tests, "Optimise all windows tests with/without the C++ kernel", True),

@@ -85,6 +85,7 @@ from compare import Compare
 from plugin_system import PluginSystem
 from github import GitHub
 from ha import run_async
+from degradation import DegradationModel, CHEMISTRY_PARAMETERS
 
 
 class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, Marginal, Execute, Output, UserInterface, GitHub):
@@ -1660,6 +1661,25 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
 
             # Restore the last saved plan so it is immediately active before the first calculation
             self.load_plan()
+
+            # Init degradation model (Phase 1: overlay only)
+            if self.get_arg("degradation_enable", False):
+                self.degradation_enable = True
+                self.degradation_model = DegradationModel(
+                    chemistry=self.get_arg("degradation_chemistry", "LFP"),
+                    battery_capacity_kwh=self.get_arg("degradation_battery_capacity", 24.0),
+                    capex=self.get_arg("degradation_capex", 1000000),
+                    lifetime_cycles=self.get_arg("degradation_lifetime_cycles", 8000),
+                )
+                self.log(
+                    "Degradation model enabled: chemistry={}, baseline_cost={:.4f} c/kWh".format(
+                        self.degradation_model.chemistry,
+                        self.degradation_model.baseline_cycle_cost(),
+                    )
+                )
+            else:
+                self.degradation_enable = False
+                self.degradation_model = None
 
         except Exception as e:
             self.log("Error: Exception raised {}".format(e))

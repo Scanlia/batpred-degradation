@@ -3921,6 +3921,10 @@ class Plan:
                 self.predict_metric_best = pred.predict_metric_best
                 self.predict_carbon_best = pred.predict_carbon_best
                 self.predict_clipped_best = pred.predict_clipped_best
+                if hasattr(pred, "predict_degradation_multiplier"):
+                    self.predict_degradation_multiplier_best = pred.predict_degradation_multiplier.copy()
+                elif not hasattr(self, "predict_degradation_multiplier_best"):
+                    self.predict_degradation_multiplier_best = {}
 
             if save:
                 self.log(
