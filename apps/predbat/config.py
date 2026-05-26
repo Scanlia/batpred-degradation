@@ -477,6 +477,13 @@ CONFIG_ITEMS = [
         "default": 24.0,
     },
     {
+        "name": "degradation_compare_enable",
+        "friendly_name": "Degradation Plan Comparison",
+        "type": "switch",
+        "enable": "expert_mode",
+        "default": False,
+    },
+    {
         "name": "metric_battery_value_scaling",
         "friendly_name": "Metric Battery Value Scaling",
         "type": "input_number",
@@ -2428,4 +2435,10 @@ APPS_SCHEMA = {
     "gateway_mqtt_host": {"type": "string", "empty": False},
     "gateway_mqtt_port": {"type": "integer", "zero": False},
     "gateway_mqtt_token": {"type": "string", "empty": False},
+    "degradation_enable": {"type": "boolean"},
+    "degradation_chemistry": {"type": "string"},
+    "degradation_capex": {"type": "float"},
+    "degradation_lifetime_cycles": {"type": "integer"},
+    "degradation_battery_capacity": {"type": "float"},
+    "degradation_compare_enable": {"type": "boolean"},
 }

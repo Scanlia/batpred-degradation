@@ -1680,6 +1680,8 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
             else:
                 self.degradation_enable = False
                 self.degradation_model = None
+            self.degradation_compare_enable = self.degradation_enable and self.args.get("degradation_compare_enable", False)
+            self._use_degradation_metric = False
 
         except Exception as e:
             self.log("Error: Exception raised {}".format(e))
