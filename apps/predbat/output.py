@@ -589,6 +589,11 @@ class Output:
         if self.carbon_enable:
             html += "<th><b>CO2 g/kWh</b></th>"
             html += "<th><b>CO2 kg</b></th>"
+        if getattr(self, "degradation_compare_enable", False):
+            html += "<th style='border-left:2px solid #90caf9; background:#e3f2fd'><b> Degrad </b></th>"
+            html += "<th style='background:#e3f2fd'><b>Wear x</b></th>"
+            html += "<th style='background:#e3f2fd'><b>C</b></th>"
+            html += "<th style='background:#e3f2fd'><b>Wear c</b></th>"
         html += "</tr>"
         return html
 
@@ -1034,6 +1039,7 @@ class Output:
         raw_plan["iboost_enable"] = self.iboost_enable
         raw_plan["carbon_enable"] = self.carbon_enable
         raw_plan["degradation_enable"] = getattr(self, "degradation_enable", False)
+        raw_plan["degradation_compare_enable"] = getattr(self, "degradation_compare_enable", False)
         raw_plan["manual_load_value"] = self.get_arg("manual_load_value", 0.5)
 
         rate_start = self.midnight_utc
@@ -1624,11 +1630,30 @@ class Output:
                     html += "<td id=wear_crate bgcolor=#FFFFFF>{:.2f}C</td>".format(wear_c_rate)
                 else:
                     html += "<td id=wear_crate bgcolor=#FFFFFF>-</td>"
-                html += "<td id=wear_c bgcolor=#FFFFFF>{:.2f}c</td>".format(wear_c)
+                if wear_c < 0.5:
+                    wc_color = "#FFFFFF"
+                elif wear_c < 5:
+                    wc_color = "#FFF8E1"
+                elif wear_c < 20:
+                    wc_color = "#FFCC80"
+                else:
+                    wc_color = "#FFCDD2"
+                html += "<td id=wear_c bgcolor=" + wc_color + ">{:.2f}c</td>".format(wear_c)
             html += "<td id=total_cost bgcolor=#FFFFFF>" + str(total_str) + "</td>"
             if self.carbon_enable:
                 html += "<td id=carbon bgcolor=" + carbon_intensity_color + ">" + str(carbon_intensity) + " </td>"
                 html += "<td id=total_carbon bgcolor=" + carbon_color + "> " + str(carbon_str) + " </td>"
+            if getattr(self, "degradation_compare_enable", False):
+                html += "<td id=degrad_sep bgcolor=#e3f2fd style='border-left:2px solid #90caf9'></td>"
+                if wear_x > 0:
+                    html += "<td id=degrad_wear_x bgcolor=" + wear_x_color + ">x{:.2f}</td>".format(wear_x)
+                else:
+                    html += "<td id=degrad_wear_x bgcolor=#FFFFFF>-</td>"
+                if wear_c_rate > 0:
+                    html += "<td id=degrad_wear_crate bgcolor=#FFFFFF>{:.2f}C</td>".format(wear_c_rate)
+                else:
+                    html += "<td id=degrad_wear_crate bgcolor=#FFFFFF>-</td>"
+                html += "<td id=degrad_wear_c bgcolor=" + wc_color + ">{:.2f}c</td>".format(wear_c)
             html += "</tr>\n"
 
             # Json row
@@ -1767,6 +1792,11 @@ class Output:
         if self.carbon_enable:
             carbon_amount_end = self.predict_carbon_best.get(minute_relative_slot_end, carbon_amount)
             html += "<td></td><td bgcolor=#FFFFFF><b>{}</b></td>".format(dp2(carbon_amount_end / 1000.0))
+        if getattr(self, "degradation_compare_enable", False):
+            html += "<td bgcolor=#e3f2fd style='border-left:2px solid #90caf9'></td>"
+            html += "<td bgcolor=#FFFFFF><b>x{:.2f}</b></td>".format(avg_wear_x)
+            html += "<td bgcolor=#FFFFFF></td>"
+            html += "<td bgcolor=#FFFFFF><b>{:.1f}c</b></td>".format(round(degrad_wear_c_total, 1))
         html += "</tr>\n"
         html += "</table>"
         html = html.replace("£", "&#163;")

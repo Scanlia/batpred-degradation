@@ -879,7 +879,8 @@ class Plan:
             end_record=end_record,
             save=save,
         )
-        metric, battery_value = self.compute_metric(self.end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh)
+        degradation_weighted_cycle = self.prediction.final_degradation_weighted_cycle if hasattr(self, "prediction") and hasattr(self.prediction, "final_degradation_weighted_cycle") else 0.0
+        metric, battery_value = self.compute_metric(self.end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh, degradation_weighted_cycle=degradation_weighted_cycle)
         return metric, battery_value, cost, metric_keep, battery_cycle, final_carbon_g, import_kwh_battery + import_kwh_house, export_kwh
 
     def in_charge_window(self, charge_window, minute_abs):
@@ -1444,7 +1445,7 @@ class Plan:
         # Return if we recomputed or not
         return recompute
 
-    def compute_metric(self, end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh):
+    def compute_metric(self, end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh, degradation_weighted_cycle=None):
         """
         Compute the metric combing pv and pv10 data
         """
@@ -1477,8 +1478,12 @@ class Plan:
         # Self sufficiency metric
         metric += (import_kwh_house + import_kwh_battery) * self.metric_self_sufficiency
 
-        # Adjustment for battery cycles metric
-        metric += battery_cycle * self.metric_battery_cycle + metric_keep
+        # Adjustment for battery cycles metric — use degradation-weighted if available
+        if degradation_weighted_cycle is not None and getattr(self, "degradation_enable", False) and hasattr(self, "degradation_model") and self.degradation_model:
+            blc = self.degradation_model.baseline_cycle_cost()
+            metric += degradation_weighted_cycle * blc + metric_keep
+        else:
+            metric += battery_cycle * self.metric_battery_cycle + metric_keep
 
         return dp4(metric), dp4(battery_value)
 
