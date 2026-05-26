@@ -6406,6 +6406,13 @@ def get_plan_renderer_js():
                 html += '<th><b>CO2 g/kWh</b></th>';
                 html += '<th><b>CO2 kg</b></th>';
             }
+            if (jsonData.degradation_compare_enable) {
+                html += '<th style=\"border-left:2px solid #90caf9; background:#e3f2fd\"><b> Degrad </b></th>';
+                html += '<th style=\"background:#e3f2fd\"><b>Wear x</b></th>';
+                html += '<th style=\"background:#e3f2fd\"><b>C</b></th>';
+                html += '<th style=\"background:#e3f2fd\"><b>Wear c</b></th>';
+            }
+
             html += '</tr>';
 
             // Render rows
@@ -6563,9 +6570,13 @@ def get_plan_renderer_js():
                     } else {
                         html += '<td id=wear_crate bgcolor=#FFFFFF>-</td>';
                     }
-                    // Wear c (cycle + calendar cost in cents, always non-zero)
+                    // Wear c (cycle + calendar cost in cents)
                     const wc = row.wear_c;
-                    html += `<td id=wear_c bgcolor=#FFFFFF>${wc.toFixed(2)}c</td>`;
+                    let wcColor = '#FFFFFF';
+                    if (wc >= 20) wcColor = '#FFCDD2';
+                    else if (wc >= 5) wcColor = '#FFCC80';
+                    else if (wc >= 0.5) wcColor = '#FFF8E1';
+                    html += `<td id=wear_c bgcolor=${wcColor}>${wc.toFixed(2)}c</td>`;
                 }
 
                 // Total cost
@@ -6576,6 +6587,37 @@ def get_plan_renderer_js():
                 if (jsonData.carbon_enable) {
                     html += `<td id=carbon bgcolor=${row.carbon_intensity_color || '#FFFFFF'}>${row.carbon_intensity || ''}</td>`;
                     html += `<td id=total_carbon bgcolor=${row.carbon_color || '#FFFFFF'}>${row.total_carbon || ''}</td>`;
+                }
+
+                // Degradation compare columns (Phase 2 side-by-side)
+                if (jsonData.degradation_compare_enable) {
+                    const wx = row.wear_x;
+                    let wearColor = '#FFFFFF';
+                    if (wx !== undefined && wx > 0) {
+                        if (wx < 0.8) wearColor = '#E8F5E9';
+                        else if (wx < 1.2) wearColor = '#FFFFFF';
+                        else if (wx < 2.0) wearColor = '#FFF8E1';
+                        else if (wx < 3.0) wearColor = '#FFCDD2';
+                        else wearColor = '#EF5350';
+                    }
+                    html += '<td id=degrad_sep style=\"border-left:2px solid #90caf9\" bgcolor=#e3f2fd></td>';
+                    if (wx !== undefined && wx > 0) {
+                        html += `<td id=degrad_wear_x bgcolor=${wearColor}>x${wx.toFixed(2)}</td>`;
+                    } else {
+                        html += '<td id=degrad_wear_x bgcolor=#FFFFFF>-</td>';
+                    }
+                    const cRate = row.wear_c_rate;
+                    if (cRate !== undefined && cRate > 0) {
+                        html += `<td id=degrad_wear_crate bgcolor=#FFFFFF>${cRate.toFixed(2)}C</td>`;
+                    } else {
+                        html += '<td id=degrad_wear_crate bgcolor=#FFFFFF>-</td>';
+                    }
+                    const wc = row.wear_c;
+                    let wcColor = '#FFFFFF';
+                    if (wc >= 20) wcColor = '#FFCDD2';
+                    else if (wc >= 5) wcColor = '#FFCC80';
+                    else if (wc >= 0.5) wcColor = '#FFF8E1';
+                    html += `<td id=degrad_wear_c bgcolor=${wcColor}>${wc.toFixed(2)}c</td>`;
                 }
 
                 html += '</tr>';
@@ -6641,6 +6683,16 @@ def get_plan_renderer_js():
                 if (jsonData.carbon_enable) {
                     html += '<td></td>'; // Empty cell for carbon intensity
                     html += `<td bgcolor=#FFFFFF><b>${totals.total_carbon || ''}</b></td>`;
+                }
+
+                // Degradation compare totals (Phase 2 side-by-side)
+                if (jsonData.degradation_compare_enable) {
+                    const wxAvg = totals.wear_x_avg !== undefined ? totals.wear_x_avg : 0;
+                    const wcTotal = totals.wear_c_total !== undefined ? totals.wear_c_total : 0;
+                    html += '<td bgcolor=#e3f2fd style=\"border-left:2px solid #90caf9\"></td>';
+                    html += `<td bgcolor=#FFFFFF><b>x${wxAvg.toFixed(2)}</b></td>`;
+                    html += '<td bgcolor=#FFFFFF></td>';
+                    html += `<td bgcolor=#FFFFFF><b>${wcTotal.toFixed(1)}c</b></td>`;
                 }
 
                 html += '</tr>';
