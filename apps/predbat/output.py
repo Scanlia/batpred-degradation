@@ -554,6 +554,10 @@ class Output:
             html += "<th><b>iBoost kWh</b></th>"
         html += "<th><b>SoC %</b></th>"
         html += "<th><b>Cost</b></th>"
+        if getattr(self, "degradation_enable", False):
+            html += "<th><b>Wear x</b></th>"
+            html += "<th><b>C</b></th>"
+            html += "<th><b>Wear c</b></th>"
         html += "<th><b>Total</b></th>"
         if self.carbon_enable:
             html += "<th><b>CO2 g/kWh</b></th>"
@@ -972,6 +976,9 @@ class Output:
         load_total = 0
         xload_total = 0
         car_total = 0
+        degrad_wear_c_total = 0.0
+        degrad_wear_x_weighted = 0.0
+        degrad_throughput_total = 0.0
         raw_plan = {}
         raw_plan["rows"] = []
 
@@ -998,6 +1005,7 @@ class Output:
         raw_plan["num_cars"] = self.num_cars
         raw_plan["iboost_enable"] = self.iboost_enable
         raw_plan["carbon_enable"] = self.carbon_enable
+        raw_plan["degradation_enable"] = getattr(self, "degradation_enable", False)
         raw_plan["manual_load_value"] = self.get_arg("manual_load_value", 0.5)
 
         rate_start = self.midnight_utc
@@ -1135,6 +1143,61 @@ class Output:
             metric_start = self.predict_metric_best.get(minute_relative_start, 0.0)
             metric_end = self.predict_metric_best.get(minute_relative_slot_end, metric_start)
             metric_change = metric_end - metric_start
+
+            # Per-row degradation data (Phase 1 overlay)
+            degradation_mult_row = 0.0
+            wear_x = 0.0
+            wear_c = 0.0
+            wear_c_rate = 0.0
+            if getattr(self, "degradation_enable", False) and hasattr(self, "degradation_model") and self.degradation_model:
+                mid_soc = soc_percent - (soc_change / self.soc_max * 100.0 / 2.0)
+                is_chg = soc_change > 0
+                if hasattr(self, "battery_temperature_prediction") and self.battery_temperature_prediction:
+                    temp_c = self.battery_temperature_prediction.get(minute_start, getattr(self, "battery_temperature", 21))
+                else:
+                    temp_c = getattr(self, "battery_temperature", 21)
+                blc = self.degradation_model.baseline_cycle_cost()
+
+                # Actual per-step multipliers (includes C-rate) from the prediction simulation
+                if hasattr(self, "predict_degradation_multiplier_best") and self.predict_degradation_multiplier_best:
+                    mult_values = []
+                    for m in range(minute_start, minute_end, PREDICT_STEP):
+                        v = self.predict_degradation_multiplier_best.get(m)
+                        if v is not None:
+                            mult_values.append(v)
+                    if mult_values:
+                        degradation_mult_row = round(sum(mult_values) / len(mult_values), 2)
+
+                # Condition-only multiplier (temperature + SoC + direction, 0.5C reference)
+                wear_x = round(self.degradation_model.compute_condition_multiplier(
+                    temp_c=temp_c, soc_percent=mid_soc, is_charging=is_chg
+                ), 2)
+
+                # C-rate for this 30-min slot (display only)
+                if abs(soc_change) > 0.01:
+                    wear_c_rate = round(abs(soc_change) / 0.5 / self.degradation_model.battery_capacity_kwh, 2)
+                else:
+                    wear_c_rate = 0.0
+
+                # Cycle wear cost for this row (cents)
+                if degradation_mult_row > 0 and abs(soc_change) > 0.01:
+                    wear_c = round(abs(soc_change) * blc * degradation_mult_row, 2)
+
+                # Calendar aging cost: always present (battery ages 24/7)
+                soc_d = mid_soc / 100.0
+                if soc_d > 0.8:
+                    cal_stress = 1.0 + math.exp(5.0 * (soc_d - 0.8))
+                elif soc_d < 0.2:
+                    cal_stress = 1.0 + math.exp(5.0 * (0.2 - soc_d))
+                else:
+                    cal_stress = 1.0
+                cal_temp = math.exp(-24000.0 / (8.314 * (temp_c + 273.15))) / math.exp(-24000.0 / (8.314 * 298.15))
+                calendar_cost = round(0.01 * cal_stress * cal_temp, 2)
+                wear_c = round(wear_c + calendar_cost, 2)
+
+                degrad_wear_c_total += wear_c
+                degrad_wear_x_weighted += abs(soc_change) * wear_x
+                degrad_throughput_total += abs(soc_change)
 
             # Raw state for raw plan
             raw_state = "Demand"
@@ -1486,6 +1549,26 @@ class Output:
                 html += "<td bgcolor=" + iboost_color + ">" + iboost_amount_str + " </td>"
             html += "<td id=soc data-minute=" + str(minute) + " bgcolor=" + soc_color + ">" + str(soc_percent) + soc_sym + "</td>"
             html += "<td id=cost bgcolor=" + cost_color + ">" + str(cost_str) + "</td>"
+            if getattr(self, "degradation_enable", False):
+                if wear_x > 0:
+                    if wear_x < 0.8:
+                        wear_x_color = "#E8F5E9"
+                    elif wear_x < 1.2:
+                        wear_x_color = "#FFFFFF"
+                    elif wear_x < 2.0:
+                        wear_x_color = "#FFF8E1"
+                    elif wear_x < 3.0:
+                        wear_x_color = "#FFCDD2"
+                    else:
+                        wear_x_color = "#EF5350"
+                    html += "<td id=wear_x bgcolor=" + wear_x_color + ">x{:.2f}</td>".format(wear_x)
+                else:
+                    html += "<td id=wear_x bgcolor=#FFFFFF>-</td>"
+                if wear_c_rate > 0:
+                    html += "<td id=wear_crate bgcolor=#FFFFFF>{:.2f}C</td>".format(wear_c_rate)
+                else:
+                    html += "<td id=wear_crate bgcolor=#FFFFFF>-</td>"
+                html += "<td id=wear_c bgcolor=#FFFFFF>{:.2f}c</td>".format(wear_c)
             html += "<td id=total_cost bgcolor=#FFFFFF>" + str(total_str) + "</td>"
             if self.carbon_enable:
                 html += "<td id=carbon bgcolor=" + carbon_intensity_color + ">" + str(carbon_intensity) + " </td>"
@@ -1576,6 +1659,12 @@ class Output:
                 json_row["total_carbon"] = dp2(carbon_amount / 1000.0)
                 json_row["carbon_intensity_color"] = carbon_intensity_color
                 json_row["carbon_color"] = carbon_color
+            # Degradation overlay (Phase 1: display only)
+            if getattr(self, "degradation_enable", False):
+                json_row["degradation_multiplier"] = float("{:.2f}".format(degradation_mult_row))
+                json_row["wear_x"] = float("{:.2f}".format(wear_x))
+                json_row["wear_c"] = float("{:.2f}".format(wear_c))
+                json_row["wear_c_rate"] = float("{:.2f}".format(wear_c_rate))
             # Add rowspan hints for client-side rendering
             json_row["rowspan_state"] = rowspan if start_span else 0
             json_row["skip_state_cell"] = in_span and not start_span
@@ -1608,6 +1697,14 @@ class Output:
             html += "<td bgcolor=#FFFFFF><b>{}</b></td>".format(iboost_amount_str)
         html += "<td bgcolor=#FFFFFF><b>" + str(soc_percent_end) + "</b></td>"
         html += "<td></td>"  # Soc change
+        if getattr(self, "degradation_enable", False):
+            if degrad_throughput_total > 0:
+                avg_wear_x = round(degrad_wear_x_weighted / degrad_throughput_total, 2)
+            else:
+                avg_wear_x = 0.0
+            html += "<td bgcolor=#FFFFFF><b>x{:.2f}</b></td>".format(avg_wear_x)
+            html += "<td bgcolor=#FFFFFF></td>"
+            html += "<td bgcolor=#FFFFFF><b>{:.1f}c</b></td>".format(round(degrad_wear_c_total, 1))
         html += "<td bgcolor=#FFFFFF><b>" + str(total_str) + "</b></td>"
         if self.carbon_enable:
             carbon_amount_end = self.predict_carbon_best.get(minute_relative_slot_end, carbon_amount)
@@ -1633,6 +1730,15 @@ class Output:
         if self.carbon_enable:
             totals["carbon_intensity"] = carbon_intensity
             totals["total_carbon"] = dp2(carbon_amount_end / 1000.0)
+        # Degradation totals
+        if getattr(self, "degradation_enable", False):
+            if hasattr(self, "degradation_model") and self.degradation_model:
+                raw_plan["degradation_baseline_cost"] = round(self.degradation_model.baseline_cycle_cost(), 4)
+            if hasattr(self, "prediction") and hasattr(self.prediction, "final_degradation_weighted_cycle"):
+                totals["degradation_weighted_cycle"] = round(self.prediction.final_degradation_weighted_cycle, 4)
+                totals["battery_cycle"] = round(self.prediction.final_battery_cycle, 4)
+            totals["wear_x_avg"] = float("{:.2f}".format(degrad_wear_x_weighted / degrad_throughput_total)) if degrad_throughput_total > 0 else 0.0
+            totals["wear_c_total"] = float("{:.1f}".format(degrad_wear_c_total))
         raw_plan["totals"] = totals
 
         # Add timestamp to the plan data

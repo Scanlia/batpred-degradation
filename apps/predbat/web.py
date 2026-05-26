@@ -3157,6 +3157,12 @@ chart.render();
                     "Enable it in apps.yaml (<code>battery_scaling_auto: true</code>) so Predbat can automatically "
                     "scale the usable battery capacity to reflect real-world degradation shown in this chart.</p>\n"
                 )
+        elif chart == "BatteryTemp":
+            battery_temp_results = self.get_entity_results(self.prefix + ".battery_temperature")
+            series_data = [
+                {"name": "Battery Temp", "data": battery_temp_results, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#eb2323", "unit": "°C"},
+            ]
+            text += self.render_chart(series_data, "°C", "Battery Temperature", now_str)
         elif chart == "MarginalCosts":
             sensor_attrs = self.base.dashboard_values.get("sensor." + self.prefix + "_marginal_energy_costs", {}).get("attributes", {})
             matrix = sensor_attrs.get("matrix", {})
@@ -3280,6 +3286,7 @@ chart.render();
         text += f'<a href="./charts?chart=PVAccuracy" class="{"active" if chart == "PVAccuracy" else ""}">PVAccuracy</a>'
         text += f'<a href="./charts?chart=Savings" class="{"active" if chart == "Savings" else ""}">Savings</a>'
         text += f'<a href="./charts?chart=BatteryDegradation" class="{"active" if chart == "BatteryDegradation" else ""}">BatteryDegradation</a>'
+        text += f'<a href="./charts?chart=BatteryTemp" class="{"active" if chart == "BatteryTemp" else ""}">BatteryTemp</a>'
         text += f'<a href="./charts?chart=MarginalCosts" class="{"active" if chart == "MarginalCosts" else ""}">MarginalCosts</a>'
         # Only show LoadML chart if ML is enabled
         if self.base.get_arg("load_ml_enable", False):
