@@ -6444,6 +6444,11 @@ def get_plan_renderer_js():
             }
             html += '<th><b>SoC %</b></th>';
             html += '<th><b>Cost</b></th>';
+            if (jsonData.degradation_enable) {
+                html += '<th><b>Wear x</b></th>';
+                html += '<th><b>C</b></th>';
+                html += '<th><b>Wear c</b></th>';
+            }
             html += '<th><b>Total</b></th>';
             if (jsonData.carbon_enable) {
                 html += '<th><b>CO2 g/kWh</b></th>';
@@ -6586,6 +6591,32 @@ def get_plan_renderer_js():
                 }
                 html += `<td id=cost bgcolor=${row.cost_color || '#FFFFFF'}>${costStr}</td>`;
 
+                // Wear x (condition-only multiplier, no C-rate)
+                if (jsonData.degradation_enable) {
+                    const wx = row.wear_x;
+                    if (wx !== undefined && wx > 0) {
+                        let wearColor = '#FFFFFF';
+                        if (wx < 0.8) wearColor = '#E8F5E9';
+                        else if (wx < 1.2) wearColor = '#FFFFFF';
+                        else if (wx < 2.0) wearColor = '#FFF8E1';
+                        else if (wx < 3.0) wearColor = '#FFCDD2';
+                        else wearColor = '#EF5350';
+                        html += `<td id=wear_x bgcolor=${wearColor}>x${wx.toFixed(2)}</td>`;
+                    } else {
+                        html += '<td id=wear_x bgcolor=#FFFFFF>-</td>';
+                    }
+                    // C-rate for the 30-min slot
+                    const cRate = row.wear_c_rate;
+                    if (cRate !== undefined && cRate > 0) {
+                        html += `<td id=wear_crate bgcolor=#FFFFFF>${cRate.toFixed(2)}C</td>`;
+                    } else {
+                        html += '<td id=wear_crate bgcolor=#FFFFFF>-</td>';
+                    }
+                    // Wear c (cycle + calendar cost in cents, always non-zero)
+                    const wc = row.wear_c;
+                    html += `<td id=wear_c bgcolor=#FFFFFF>${wc.toFixed(2)}c</td>`;
+                }
+
                 // Total cost
                 const totalCost = row.total_cost ? `${jsonData.currency_symbols[0]}${row.total_cost.toFixed(2)}` : '';
                 html += `<td id=total_cost bgcolor=#FFFFFF>${totalCost}</td>`;
@@ -6639,6 +6670,15 @@ def get_plan_renderer_js():
 
                 // Empty cell for SOC change
                 html += '<td></td>';
+
+                // Wear x average + wear c total
+                if (jsonData.degradation_enable) {
+                    const wxAvg = totals.wear_x_avg !== undefined ? totals.wear_x_avg : 0;
+                    const wcTotal = totals.wear_c_total !== undefined ? totals.wear_c_total : 0;
+                    html += `<td bgcolor=#FFFFFF><b>x${wxAvg.toFixed(2)}</b></td>`;
+                    html += '<td bgcolor=#FFFFFF></td>';
+                    html += `<td bgcolor=#FFFFFF><b>${wcTotal.toFixed(1)}c</b></td>`;
+                }
 
                 // Total cost
                 const totalCostStr = totals.total_cost >= 0 ?
