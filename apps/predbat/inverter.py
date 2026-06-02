@@ -154,6 +154,7 @@ class Inverter:
         self.reserve_percent = self.base.get_arg("battery_min_soc", default=4.0, index=self.id, required_unit="%")
         self.reserve_percent_current = self.base.get_arg("battery_min_soc", default=4.0, index=self.id, required_unit="%")
         self.battery_scaling = self.base.get_arg("battery_scaling", default=1.0, index=self.id)
+        self.battery_scaling_config = self.battery_scaling
 
         self.reserve_max = 100
         self.battery_rate_max_raw = 2600.0
@@ -384,9 +385,6 @@ class Inverter:
 
             ivtime = self.base.get_arg("inverter_time", index=self.id, default=None)
 
-        # Track and update battery size (if automatic)
-        self.battery_size_tracking()
-
         # Battery rate max charge, discharge (all converted to kW/min)
         inverter_limit_charge = self.base.get_arg("inverter_limit_charge", self.battery_rate_max_raw, index=self.id, required_unit="W")
         inverter_limit_discharge = self.base.get_arg("inverter_limit_discharge", self.battery_rate_max_raw, index=self.id, required_unit="W")
@@ -402,6 +400,9 @@ class Inverter:
         inverter_limit_export = self.base.get_arg("inverter_limit_export", inverter_limit_discharge, index=self.id, required_unit="W")
         self.battery_rate_max_export = min(inverter_limit_export, self.battery_rate_max_raw) / MINUTE_WATT
         self.battery_rate_min = min(self.base.get_arg("inverter_battery_rate_min", 0, index=self.id, required_unit="W"), self.battery_rate_max_raw) / MINUTE_WATT
+
+        # Track and update battery size (if automatic)
+        self.battery_size_tracking()
 
         # Convert inverter time into timestamp
         if ivtime:
@@ -585,14 +586,19 @@ class Inverter:
 
         if self.base.battery_scaling_auto and trimmed_mean and trimmed_mean > 0:
             if self.nominal_capacity > 0:
-                # Clamp scaling to [0.8, 1.0] relative to nominal
-                new_scaling = max(0.8, min(1.0, trimmed_mean / self.nominal_capacity))
+                # Clamp scaling to [80%, 100%] of the configured usable scaling.
+                # This preserves manual DoD/SOH correction (e.g. 0.8) while allowing measured degradation below it.
+                scaling_upper = self.battery_scaling_config
+                scaling_lower = self.battery_scaling_config * 0.8
+                new_scaling = max(scaling_lower, min(scaling_upper, trimmed_mean / self.nominal_capacity))
+                self.battery_scaling = new_scaling
                 self.soc_max = dp3(self.nominal_capacity * new_scaling)
                 self.log("Info: inverter {} battery_scaling_auto set scaling {:.3f} (mean {:.2f} kWh, nominal {:.2f} kWh) resulting in soc_max {:.3f} kWh".format(self.id, new_scaling, trimmed_mean, self.nominal_capacity, self.soc_max))
             else:
                 # No nominal configured - use trimmed mean directly without clamping
                 self.soc_max = dp3(trimmed_mean)
                 self.nominal_capacity = self.soc_max
+                self.battery_scaling = 1.0
                 self.base.set_arg("soc_max", self.soc_max, index=self.id)
                 self.base.set_arg("soc_max_nominal", 0.0, index=self.id)
                 self.log("Info: Inverter {} battery_scaling_auto using measured mean {:.2f} kWh (no nominal configured)".format(self.id, trimmed_mean))
@@ -690,7 +696,6 @@ class Inverter:
         soc_kw_sensor = self.base.get_arg("soc_kw", indirect=False, index=self.id)
         battery_power_sensor = self.base.get_arg("battery_power", indirect=False, index=self.id)
         battery_power_invert = self.base.get_arg("battery_power_invert", False, index=self.id)
-        max_power = int(self.battery_rate_max_charge * MINUTE_WATT)
 
         if (soc_percent_sensor or soc_kw_sensor) and battery_power_sensor:
             if soc_percent_sensor:
@@ -766,7 +771,7 @@ class Inverter:
 
             # Find continuous charging periods and calculate battery size from energy/SoC relationship
             # Data is indexed backwards: minute 0 = now, minute N = N minutes ago
-            max_power_threshold = max_power * 0.9
+            max_power_threshold = 50
 
             # Scan backwards through time to find charging periods
             in_charge = False
@@ -803,41 +808,41 @@ class Inverter:
                             )
                         )
 
-                        # Clip to 20-80% range and align to percentage boundaries
+                        # Clip to 10-90% range and align to percentage boundaries
                         # to avoid partial energy from transition minutes
                         # A "transition minute" is one where the SoC changed from the previous minute
                         # We want to start AFTER a transition and end BEFORE a transition
                         clipped_start_minute = charge_start_minute
                         clipped_end_minute = charge_end_minute
 
-                        # Find first stable minute ≥20% (where SoC didn't just change)
+                        # Find first stable minute ≥10% (where SoC didn't just change)
                         # Search forward in real time (decreasing minute index)
                         found_start = False
                         for m in range(charge_start_minute, charge_end_minute - 1, -1):
                             curr_soc = int(soc_percent.get(m, 0))
                             prev_soc = int(soc_percent.get(m + 1, 0))  # m+1 is older
                             # Check if this is a stable minute (no transition) and within range
-                            if curr_soc >= 20 and curr_soc <= 80 and curr_soc != prev_soc:
+                            if curr_soc >= 10 and curr_soc <= 90 and curr_soc != prev_soc:
                                 clipped_start_minute = m
                                 found_start = True
                                 break
                         if not found_start:
-                            # No stable minute found in 20-80% range, skip this period
+                            # No stable minute found in 10-90% range, skip this period
                             continue
 
-                        # Find last stable minute ≤80% (where SoC won't change next minute)
+                        # Find last stable minute ≤90% (where SoC won't change next minute)
                         # Search backward in real time (increasing minute index)
                         found_end = False
                         for m in range(charge_end_minute, charge_start_minute + 1):
                             curr_soc = int(soc_percent.get(m, 0))
                             next_soc = int(soc_percent.get(m + 1, 0))  # m+1 is older
                             # Check if this is a stable minute (no upcoming transition) and within range
-                            if curr_soc >= 20 and curr_soc <= 80 and curr_soc != next_soc:
+                            if curr_soc >= 10 and curr_soc <= 90 and curr_soc != next_soc:
                                 clipped_end_minute = m
                                 found_end = True
                                 break
                         if not found_end:
-                            # No stable minute found in 20-80% range, skip this period
+                            # No stable minute found in 10-90% range, skip this period
                             continue
 
                         # Validate the clipped range is still valid
@@ -859,7 +864,7 @@ class Inverter:
                             )
                         )
 
-                        if percent_change > 15:  # Need at least 15% change for a meaningful estimate
+                        if percent_change > 5:  # Need at least 5% change for a meaningful estimate
                             # Calculate energy added during this period (using clipped range)
                             power_added = 0.0
                             sample_count = 0
@@ -1795,6 +1800,11 @@ class Inverter:
                 self.rest_setChargeTarget(soc)
             else:
                 self.write_and_poll_value("charge_limit", self.base.get_arg("charge_limit", indirect=False, index=self.id, required_unit="%"), soc)
+
+            charge_limit_enable_entity_id = self.base.get_arg("charge_limit_enable", indirect=False, index=self.id)
+            if charge_limit_enable_entity_id:
+                # If we have a separate enable for the charge limit then make sure it's enabled when we set the charge limit
+                self.write_and_poll_switch("charge_limit_enable", charge_limit_enable_entity_id, True)
 
             # For inverters that need a button press to apply changes (e.g., Fox), press the button now
             if self.inv_time_button_press:
