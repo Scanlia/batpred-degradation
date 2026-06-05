@@ -132,6 +132,12 @@ class Prediction:
             self.set_export_window = base.set_export_window
             self.calculate_export_on_pv = base.calculate_export_on_pv
             self.charge_low_power_margin = base.charge_low_power_margin
+            self.degradation_compare_low_power = getattr(base, "degradation_compare_low_power", False)
+            # Shared normalisation factor: computed ONCE from the flat plan and reused
+            # (not recomputed per-plan) so degradation-weighted cycles are on the same
+            # scale as battery_cycle / the flat metric_battery_cycle.  None until the
+            # flat plan has been evaluated.
+            self.degradation_norm_factor = getattr(base, "degradation_norm_factor", None)
             self.car_charging_slots = base.car_charging_slots
             self.car_charging_limit = base.car_charging_limit
             self.car_charging_from_battery = base.car_charging_from_battery
@@ -194,6 +200,11 @@ class Prediction:
             self.inverter_can_charge_during_export = base.inverter_can_charge_during_export
             self.prediction_cache_enable = base.prediction_cache_enable
             self.prediction_cache = {}
+            # Parallel cache for the degradation-weighted cycle, keyed by the same
+            # sim_hash.  The main prediction cache tuple has a fixed shape that is
+            # returned verbatim, so the degradation value is tracked separately and
+            # restored onto self on a cache hit (see run_prediction).
+            self.prediction_cache_degradation = {}
             self.plan_interval_minutes = base.plan_interval_minutes
             self.charge_scaling10 = base.charge_scaling10
 
@@ -224,7 +235,8 @@ class Prediction:
             iboost_running_solar,
             iboost_running_full,
         ) = self.run_prediction(charge_limit, charge_window, export_window, export_limits, pv10, end_record=end_record, step=step, cache=self.prediction_cache_enable)
-        return (cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g)
+        degradation_weighted_cycle = getattr(self, "final_degradation_weighted_cycle", 0.0)
+        return (cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g, degradation_weighted_cycle)
 
     def thread_run_prediction_charge(self, try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record):
         """
@@ -257,6 +269,7 @@ class Prediction:
             iboost_running_solar,
             iboost_running_full,
         ) = self.run_prediction(try_charge_limit, charge_window, export_window, export_limits, pv10, end_record=end_record, cache=self.prediction_cache_enable)
+        degradation_weighted_cycle = getattr(self, "final_degradation_weighted_cycle", 0.0)
         return (
             cost,
             import_kwh_battery,
@@ -269,6 +282,7 @@ class Prediction:
             metric_keep,
             final_iboost,
             final_carbon_g,
+            degradation_weighted_cycle,
         )
 
     def thread_run_prediction_charge_min_max(self, try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record):
@@ -302,6 +316,7 @@ class Prediction:
             iboost_running_solar,
             iboost_running_full,
         ) = self.run_prediction(try_charge_limit, charge_window, export_window, export_limits, pv10, end_record=end_record, cache=False)
+        degradation_weighted_cycle = getattr(self, "final_degradation_weighted_cycle", 0.0)
         min_soc = self.soc_max
         max_soc = 0
         if not all_n:
@@ -327,6 +342,7 @@ class Prediction:
             metric_keep,
             final_iboost,
             final_carbon_g,
+            degradation_weighted_cycle,
             min_soc,
             max_soc,
         )
@@ -367,7 +383,8 @@ class Prediction:
             iboost_running_solar,
             iboost_running_full,
         ) = self.run_prediction(charge_limit, charge_window, export_window, export_limits, pv10, end_record=end_record, cache=self.prediction_cache_enable)
-        return metricmid, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g
+        degradation_weighted_cycle = getattr(self, "final_degradation_weighted_cycle", 0.0)
+        return metricmid, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g, degradation_weighted_cycle
 
     def find_charge_window_optimised(self, charge_windows, charge_limit, is_export=False):
         """
@@ -396,7 +413,9 @@ class Prediction:
         sim_hash = hash(tuple(charge_limit)) ^ window_hash ^ hash(tuple(export_limits)) ^ hash(pv10) ^ hash(end_record) ^ hash(step)
 
         if not save and cache and sim_hash in self.prediction_cache:
-            # Return cached result
+            # Return cached result.  Restore the degradation-weighted cycle (read back
+            # via self by the optimiser threads) since it is not part of the tuple.
+            self.final_degradation_weighted_cycle = self.prediction_cache_degradation.get(sim_hash, 0.0)
             return self.prediction_cache[sim_hash]
 
         # Fetch data from globals, optimised away from class to avoid passing it between threads
@@ -523,7 +542,14 @@ class Prediction:
         inverter_limit = self.inverter_limit * step
         export_limit = self.export_limit * step
         pv_ac_limit = self.pv_ac_limit * step
-        set_charge_low_power = self.set_charge_window and self.set_charge_low_power and (save in ["best", "best10", "test"])
+        # Low-power (spread) charging reduces the charge C-rate and therefore wear.
+        # Normally gated behind the user's set_charge_low_power option for save runs;
+        # the degradation comparison forces it on (regardless of that option) so the
+        # degradation-aware plan is free to explore gentler, slower charging.
+        set_charge_low_power = self.set_charge_window and (
+            (self.set_charge_low_power and save in ["best", "best10", "test"])
+            or getattr(self, "degradation_compare_low_power", False)
+        )
         carbon_enable = self.carbon_enable
         reserve = self.reserve
         soc_max = self.soc_max
@@ -1163,6 +1189,7 @@ class Prediction:
                 final_export_kwh = export_kwh
                 final_iboost_kwh += iboost_amount
                 final_battery_cycle = battery_cycle
+                final_degradation_weighted_cycle = degradation_weighted_cycle
                 final_metric_keep = metric_keep
                 final_carbon_g = carbon_g
                 final_load_kwh = load_kwh
@@ -1200,7 +1227,24 @@ class Prediction:
             minute += step
 
         hours_left = minute_left / 60.0
+
+        # Apply the shared normalisation factor (read-only — computed once from the
+        # flat plan and inherited via base, never recomputed here).  This scales the
+        # degradation-weighted cycle onto the same basis as battery_cycle so the
+        # optimiser's wear cost is comparable to the flat metric_battery_cycle.
+        # Always expose final_degradation_weighted_cycle (record-bounded, like
+        # final_battery_cycle) so the optimiser threads can read it back via self even
+        # on non-save runs.
+        degradation_norm = getattr(self, "degradation_norm_factor", None)
+        if degradation_norm:
+            final_degradation_weighted_cycle *= degradation_norm
+        self.final_degradation_weighted_cycle = round(final_degradation_weighted_cycle, 4)
+
         if self.debug_enable or save:
+            # Scale the per-step multipliers for display onto the same normalised basis.
+            if degradation_norm:
+                for minute_key in self.predict_degradation_multiplier:
+                    self.predict_degradation_multiplier[minute_key] *= degradation_norm
             self.hours_left = hours_left
             self.final_car_soc = final_car_soc
             self.predict_car_soc_time = predict_car_soc_time
@@ -1215,7 +1259,6 @@ class Prediction:
             self.final_pv_kwh = round(final_pv_kwh, 4)
             self.final_iboost_kwh = round(final_iboost_kwh, 4)
             self.final_battery_cycle = round(final_battery_cycle, 4)
-            self.final_degradation_weighted_cycle = round(degradation_weighted_cycle, 4)
             self.final_soc_min = round(soc_min, 4)
             self.final_soc_min_minute = soc_min_minute
             self.export_to_first_charge = export_to_first_charge
@@ -1263,6 +1306,7 @@ class Prediction:
                 iboost_running_solar,
                 iboost_running_full,
             )
+            self.prediction_cache_degradation[sim_hash] = round(final_degradation_weighted_cycle, 4)
 
         return (
             round(final_metric, 4),
