@@ -477,6 +477,18 @@ CONFIG_ITEMS = [
         "default": 24.0,
     },
     {
+        "name": "degradation_nominal_c_rate",
+        "friendly_name": "Degradation Nominal C-rate",
+        "type": "input_number",
+        "min": 0,
+        "max": 2,
+        "step": 0.01,
+        "unit": "C",
+        "icon": "mdi:speedometer",
+        "enable": "expert_mode",
+        "default": 0,
+    },
+    {
         "name": "degradation_compare_enable",
         "friendly_name": "Degradation Plan Comparison",
         "type": "switch",
@@ -2447,6 +2459,7 @@ APPS_SCHEMA = {
     "enable_coarse_fine_levels": {"type": "boolean"},
     "load_power_fill_enable": {"type": "boolean"},
     "load_ml_enable": {"type": "boolean"},
+    "load_ml_validation_threshold": {"type": "float"},
     "gateway_device_id": {"type": "string", "empty": False},
     "gateway_mqtt_host": {"type": "string", "empty": False},
     "gateway_mqtt_port": {"type": "integer", "zero": False},
@@ -2456,5 +2469,6 @@ APPS_SCHEMA = {
     "degradation_capex": {"type": "float"},
     "degradation_lifetime_cycles": {"type": "integer"},
     "degradation_battery_capacity": {"type": "float"},
+    "degradation_nominal_c_rate": {"type": "float"},
     "degradation_compare_enable": {"type": "boolean"},
 }

@@ -55,7 +55,9 @@ CHEMISTRY_PARAMETERS = {
         "plating_threshold_k": 283.15,  # 10 C — plating onset for LFP
         "z_cyc": 0.8,
         "gamma_c_rate": 0.9,
+        "nominal_c_rate": 0.15,  # reference C-rate where the cycle multiplier == 1.0
         "soc_stress_steepness": 5.0,
+        "soc_stress_steepness_low": 3.0,
         "soc_stress_threshold": 0.8,
     },
     "NMC": {
@@ -71,7 +73,9 @@ CHEMISTRY_PARAMETERS = {
         "plating_threshold_k": 298.15,
         "z_cyc": 0.75,
         "gamma_c_rate": 1.1,
+        "nominal_c_rate": 0.3,
         "soc_stress_steepness": 6.0,
+        "soc_stress_steepness_low": 6.0,
         "soc_stress_threshold": 0.7,
     },
     "SODIUM_ION": {
@@ -87,7 +91,9 @@ CHEMISTRY_PARAMETERS = {
         "plating_threshold_k": 283.15,
         "z_cyc": 0.85,
         "gamma_c_rate": 0.8,
+        "nominal_c_rate": 0.2,
         "soc_stress_steepness": 5.0,
+        "soc_stress_steepness_low": 3.5,
         "soc_stress_threshold": 0.8,
     },
     "NCA": {
@@ -103,7 +109,9 @@ CHEMISTRY_PARAMETERS = {
         "plating_threshold_k": 298.15,
         "z_cyc": 0.7,
         "gamma_c_rate": 1.3,
+        "nominal_c_rate": 0.3,
         "soc_stress_steepness": 7.0,
+        "soc_stress_steepness_low": 7.0,
         "soc_stress_threshold": 0.65,
     },
     "LEAD_ACID": {
@@ -119,7 +127,9 @@ CHEMISTRY_PARAMETERS = {
         "plating_threshold_k": 263.15,
         "z_cyc": 0.6,
         "gamma_c_rate": 1.5,
+        "nominal_c_rate": 0.1,
         "soc_stress_steepness": 8.0,
+        "soc_stress_steepness_low": 8.0,
         "soc_stress_threshold": 0.5,
     },
     "FLOW": {
@@ -135,7 +145,9 @@ CHEMISTRY_PARAMETERS = {
         "plating_threshold_k": 0.0,
         "z_cyc": 0.8,
         "gamma_c_rate": 0.0,
+        "nominal_c_rate": 0.2,
         "soc_stress_steepness": 0.0,
+        "soc_stress_steepness_low": 0.0,
         "soc_stress_threshold": 1.0,
     },
 }
@@ -157,7 +169,7 @@ class DegradationModel:
     optimiser's decisions.
     """
 
-    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=8000):
+    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=8000, nominal_c_rate=None):
         """Initialise the degradation model.
 
         Args:
@@ -165,6 +177,11 @@ class DegradationModel:
             battery_capacity_kwh: Nominal usable capacity of the battery (kWh).
             capex: Capital cost of the battery system in local currency.
             lifetime_cycles: Manufacturer-rated equivalent full cycles to 80 % SOH.
+            nominal_c_rate: Reference C-rate at which the cycle multiplier equals
+                1.0 (overrides the per-chemistry default).  Charging/discharging
+                slower than this scores < 1.0 (rewarded); faster scores > 1.0
+                (penalised).  Pick a value representative of the battery's normal
+                operating rate so that typical cycling sits near 1.0.
         """
         params = CHEMISTRY_PARAMETERS.get(chemistry, CHEMISTRY_PARAMETERS["LFP"])
         self.chemistry = chemistry
@@ -181,7 +198,17 @@ class DegradationModel:
         self.plating_threshold_k = params["plating_threshold_k"]
         self.z_cyc = params["z_cyc"]
         self.gamma_c_rate = params["gamma_c_rate"]
+        # Reference C-rate where the cycle multiplier == 1.0.  Config override wins,
+        # otherwise fall back to the per-chemistry default (0.5 for legacy entries).
+        if nominal_c_rate and nominal_c_rate > 0:
+            self.nominal_c_rate = nominal_c_rate
+        else:
+            self.nominal_c_rate = params.get("nominal_c_rate", 0.5)
+        # Floor applied to the final multiplier so ultra-gentle cycling never looks
+        # essentially free (a battery still wears a little per kWh moved).
+        self.min_multiplier = 0.1
         self.soc_stress_steepness = params["soc_stress_steepness"]
+        self.soc_stress_steepness_low = params["soc_stress_steepness_low"]
         self.soc_stress_threshold = params["soc_stress_threshold"]
 
         self.battery_capacity_kwh = battery_capacity_kwh
@@ -219,6 +246,32 @@ class DegradationModel:
             return 0.0
         return self.capex / total_lifetime_kwh
 
+    def soc_stress_factor(self, soc_decimal):
+        """Continuous SoC stress factor (literature-aligned).
+
+        Uses a Gaussian/exponential form centred at 50 % SoC where stress
+        is minimised.  Stress rises smoothly and continuously as SoC
+        deviates from the reference — no step-function artefacts.
+
+        Uses separate steepness for high (> 50 %) and low (< 50 %) SoC
+        to capture cathode-specific asymmetry (e.g. LFP is more stable at
+        low voltage than high).
+
+        Formula:  exp(k × (soc − 0.5)²)
+          where k = soc_stress_steepness_low for soc < 0.5
+                k = soc_stress_steepness     for soc ≥ 0.5
+
+        Args:
+            soc_decimal: State of charge as a fraction (0.0–1.0).
+
+        Returns:
+            Stress factor (float ≥ 1.0).  1.0 at exactly 50 % SoC.
+        """
+        deviation = soc_decimal - 0.5
+        if deviation < 0:
+            return math.exp(self.soc_stress_steepness_low * deviation * deviation)
+        return math.exp(self.soc_stress_steepness * deviation * deviation)
+
     def compute_step_degradation_multiplier(self, temp_c, soc_percent, delta_throughput_kwh, delta_time_hours, is_charging):
         """Return the degradation multiplier for a single time step.
 
@@ -255,9 +308,10 @@ class DegradationModel:
 
         soc_decimal = soc_percent / 100.0
 
+        nominal_c_penalty = self.nominal_c_rate ** self.gamma_c_rate
         if not is_charging:
             cyc_rate = self.A_cyc_discharge * c_rate_penalty * math.exp(-self.Ea_cyc_normal / (self.R * temp_k))
-            nominal_rate = self.A_cyc_discharge * (0.5 ** self.gamma_c_rate) * math.exp(-self.Ea_cyc_normal / (self.R * T_ref))
+            nominal_rate = self.A_cyc_discharge * nominal_c_penalty * math.exp(-self.Ea_cyc_normal / (self.R * T_ref))
         else:
             if self.Ea_cyc_plating < 0:
                 plating_frac = 1.0 / (1.0 + math.exp((temp_k - self.plating_threshold_k) / 2.0))
@@ -265,7 +319,11 @@ class DegradationModel:
             else:
                 blended_ea = self.Ea_cyc_normal
             cyc_rate = self.A_cyc_charge * c_rate_penalty * math.exp(-blended_ea / (self.R * temp_k))
-            nominal_rate = self.A_cyc_charge * (0.5 ** self.gamma_c_rate) * math.exp(-self.Ea_cyc_normal / (self.R * T_ref))
+            # Anchor BOTH directions against the discharge baseline so the reference
+            # point (multiplier == 1.0) is "discharge at nominal C-rate / 25 C".
+            # Charging at nominal then scores A_cyc_charge / A_cyc_discharge (> 1.0),
+            # preserving the charge/discharge asymmetry instead of cancelling it.
+            nominal_rate = self.A_cyc_discharge * nominal_c_penalty * math.exp(-self.Ea_cyc_normal / (self.R * T_ref))
 
         if nominal_rate > 0:
             multiplier = cyc_rate / nominal_rate
@@ -277,22 +335,25 @@ class DegradationModel:
         multiplier = max(multiplier, 0.0)
         multiplier = min(multiplier, 20.0)
 
-        if soc_decimal > self.soc_stress_threshold:
-            soc_stress = 1.0 + math.exp(self.soc_stress_steepness * (soc_decimal - self.soc_stress_threshold))
-        elif soc_decimal < (1.0 - self.soc_stress_threshold):
-            soc_stress = 1.0 + math.exp(self.soc_stress_steepness * ((1.0 - self.soc_stress_threshold) - soc_decimal))
-        else:
-            soc_stress = 1.0
-        multiplier *= soc_stress
+        # A genuinely zero multiplier means the chemistry has no cycle ageing
+        # (e.g. flow batteries) — leave it at zero rather than applying the floor.
+        if multiplier <= 0.0:
+            return 0.0
 
-        return multiplier
+        multiplier *= self.soc_stress_factor(soc_decimal)
+
+        # Floor so very gentle cycling is rewarded but never treated as free.
+        return max(multiplier, self.min_multiplier)
 
     def compute_condition_multiplier(self, temp_c, soc_percent, is_charging):
         """Return the degradation multiplier for operating conditions, independent of C-rate.
 
-        Uses a reference 0.5C throughput so the result reflects temperature, SoC, and
-        charge/discharge asymmetry only.  Answers: "if I cycled 1 kWh here, how many
-        equivalent cycles of wear would it cause?"
+        Evaluates the model at the nominal C-rate so the C-rate term is exactly
+        1.0 and the result reflects temperature, SoC, and charge/discharge
+        asymmetry only.  Answers: "if I cycled the battery here at a normal rate,
+        how damaging would these conditions be relative to the reference?"  This
+        is well-defined in every slot (including idle / freeze slots where no
+        actual throughput occurs), which is why it is used for the display column.
 
         Args:
             temp_c: Cell temperature in degrees Celsius.
@@ -302,7 +363,7 @@ class DegradationModel:
         Returns:
             condition_multiplier (float >= 0)
         """
-        ref_kwh = self.battery_capacity_kwh * 0.5 * (5.0 / 60.0)
+        ref_kwh = self.battery_capacity_kwh * self.nominal_c_rate * (5.0 / 60.0)
         return self.compute_step_degradation_multiplier(
             temp_c=temp_c,
             soc_percent=soc_percent,
@@ -336,10 +397,7 @@ class DegradationModel:
         soc_decimal = soc_percent / 100.0
 
         # calendar ageing stress factor
-        if soc_decimal > self.soc_stress_threshold:
-            soc_stress = 1.0 + math.exp(self.soc_stress_steepness * (soc_decimal - self.soc_stress_threshold))
-        else:
-            soc_stress = 1.0
+        soc_stress = self.soc_stress_factor(soc_decimal)
 
         cal_rate = self.A_cal * soc_stress * math.exp(-self.Ea_cal / (self.R * temp_k))
         self.total_time_hours += delta_time_hours
