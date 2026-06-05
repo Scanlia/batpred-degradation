@@ -451,10 +451,18 @@ class Plan:
                     max_charge_slots = pred["max_charge_slots"]
                     max_export_slots = pred["max_export_slots"]
 
-                    cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g = handle.get()
-                    cost10, import_kwh_battery10, import_kwh_house10, export_kwh10, soc_min10, soc10, soc_min_minute10, battery_cycle10, metric_keep10, final_iboost10, final_carbon_g10 = handle10.get()
+                    try:
+                        cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g, degradation_weighted_cycle = handle.get()
+                    except ValueError:
+                        cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g = handle.get()
+                        degradation_weighted_cycle = battery_cycle
+                    try:
+                        cost10, import_kwh_battery10, import_kwh_house10, export_kwh10, soc_min10, soc10, soc_min_minute10, battery_cycle10, metric_keep10, final_iboost10, final_carbon_g10, degradation_weighted_cycle10 = handle10.get()
+                    except ValueError:
+                        cost10, import_kwh_battery10, import_kwh_house10, export_kwh10, soc_min10, soc10, soc_min_minute10, battery_cycle10, metric_keep10, final_iboost10, final_carbon_g10 = handle10.get()
+                        degradation_weighted_cycle10 = battery_cycle10
 
-                    metric, battery_value = self.compute_metric(end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh)
+                    metric, battery_value = self.compute_metric(end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh, degradation_weighted_cycle=degradation_weighted_cycle)
 
                     tried_list[try_hash] = metric
 
@@ -562,6 +570,52 @@ class Plan:
             best_max_charge_slots,
             best_max_export_slots,
         )
+
+    def create_thread_pool(self, max_processes=None):
+        """
+        Create the multiprocessing worker pool according to the ``threads`` config.
+
+        Worker processes are forked here and capture the current PRED_GLOBAL
+        snapshot, so this must be called *after* self.prediction is built (and
+        rebuilt) for the workers to see the latest prediction state/flags.
+
+        Args:
+            max_processes: optional hard cap on the worker count (used by the
+                degradation pass to leave host CPU/RAM headroom and avoid the
+                swap-thrash that once crashed the host).  None = no extra cap.
+        """
+        threads = self.get_arg("threads", "auto")
+        if threads == "auto":
+            processes = cpu_count()
+        elif threads:
+            processes = int(threads)
+        else:
+            self.log("Not using threading as threads is set to 0 in apps.yaml")
+            self.pool = None
+            return
+        if max_processes is not None:
+            processes = max(1, min(processes, max_processes))
+        self.log("Creating pool of {} processes (threads={}, cap={})".format(processes, threads, max_processes))
+        self.pool = Pool(processes=processes)
+
+    def recreate_thread_pool(self, max_processes=None):
+        """
+        Tear down and re-fork the worker pool so workers pick up the current
+        PRED_GLOBAL snapshot (e.g. after toggling the degradation low-power flag
+        and rebuilding self.prediction).  No-op if threading is disabled.
+
+        Args:
+            max_processes: optional hard cap on worker count (see create_thread_pool).
+        """
+        if not self.pool:
+            return
+        try:
+            self.pool.close()
+            self.pool.join()
+        except Exception as e:
+            self.log("Warn: failed to close pool before recreate: {}".format(e))
+        self.pool = None
+        self.create_thread_pool(max_processes=max_processes)
 
     def launch_run_prediction_single(self, charge_limit, charge_window, export_window, export_limits, pv10, end_record, step=PREDICT_STEP):
         """
@@ -816,7 +870,7 @@ class Plan:
             end_record=end_record,
             save=save,
         )
-        degradation_weighted_cycle = self.prediction.final_degradation_weighted_cycle if hasattr(self, "prediction") and hasattr(self.prediction, "final_degradation_weighted_cycle") else 0.0
+        degradation_weighted_cycle = getattr(self, "_degradation_weighted_cycle", 0.0)
         metric, battery_value = self.compute_metric(self.end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh, degradation_weighted_cycle=degradation_weighted_cycle)
         return metric, battery_value, cost, metric_keep, battery_cycle, final_carbon_g, import_kwh_battery + import_kwh_house, export_kwh
 
@@ -970,7 +1024,9 @@ class Plan:
         if recompute and self.calculate_savings and publish:
             self.calculate_yesterday()
 
-        # Creation prediction object
+        # Creation prediction object.  Reset the shared degradation normalisation
+        # factor each cycle so the flat plan is evaluated raw (norm computed from it).
+        self.degradation_norm_factor = None
         self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
 
         # Check if LoadML is active and disable thread pools as it causes lockup due to race conditions with NumPy
@@ -986,19 +1042,10 @@ class Plan:
                 self.pool = None
 
         # Create pool
-        if not self.pool:
-            if load_ml_calculating:
-                self.log("Not using thread pool as LoadML is calculating to avoid lockups")
-            else:
-                threads = self.get_arg("threads", "auto")
-                if threads == "auto":
-                    self.log("Creating pool of {} processes to match your CPU count".format(cpu_count()))
-                    self.pool = Pool(processes=cpu_count())
-                elif threads:
-                    self.log("Creating pool of {} processes as per apps.yaml".format(int(threads)))
-                    self.pool = Pool(processes=int(threads))
-                else:
-                    self.log("Not using threading as threads is set to 0 in apps.yaml")
+        if not self.pool and not load_ml_calculating:
+            self.create_thread_pool()
+        elif load_ml_calculating:
+            self.log("Not using thread pool as LoadML is calculating to avoid lockups")
 
         # Simulate current settings to get initial data
         metric, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g = self.run_prediction(
@@ -1218,18 +1265,158 @@ class Plan:
 
             # Publish charge and export window best
             if publish:
+                # Normalise the flat plan's wear EVERY cycle, independent of the throttled
+                # degradation pass below.  norm_factor scales the flat plan so its
+                # degradation-weighted cycle equals its raw battery_cycle (i.e. average
+                # wear multiplier == 1.0).  The flat optimise + final run above ran raw
+                # (norm reset to None at the top of calculate_plan), so compute norm from
+                # those raw values, then rebuild the prediction (so it picks up norm at
+                # construction with a fresh cache) and re-run flat with save="best" so the
+                # displayed/published flat wear is normalised.  This keeps the flat (left)
+                # table and the cached degradation (right) table on the same scale on
+                # throttled cycles too, where the degradation pass does not run.  For the
+                # flat plan norm only affects the displayed wear (not the executed plan:
+                # its metric uses the flat metric_battery_cycle, not the weighted cycle).
+                if getattr(self, "degradation_compare_enable", False) and hasattr(self, "degradation_model") and self.degradation_model:
+                    flat_battery_cycle_raw = getattr(self.prediction, "final_battery_cycle", 0.0)
+                    flat_weighted_raw = getattr(self.prediction, "final_degradation_weighted_cycle", 0.0)
+                    self.degradation_norm_factor = (flat_battery_cycle_raw / flat_weighted_raw) if flat_weighted_raw > 0 else 1.0
+                    self.log("Degradation norm_factor={:.4f} (flat battery_cycle={:.3f}, weighted_raw={:.3f})".format(self.degradation_norm_factor, flat_battery_cycle_raw, flat_weighted_raw))
+                    self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                    self.run_prediction(
+                        self.charge_limit_best, self.charge_window_best,
+                        self.export_window_best, self.export_limits_best,
+                        False, save="best", end_record=self.end_record
+                    )
+                    # Snapshot the flat best plan's cycle totals NOW, before
+                    # calculate_marginal_costs() runs its baseline prediction on
+                    # self.prediction (save=None overwrites final_degradation_weighted_cycle
+                    # unconditionally but NOT final_battery_cycle, leaving the live pair
+                    # inconsistent).  publish_html_plan reads this snapshot for the flat
+                    # table so the displayed battery_cycle/weighted_cycle are consistent and
+                    # on the normalised scale (weighted == battery_cycle, avg multiplier 1.0).
+                    self.degradation_flat_battery_cycle = getattr(self.prediction, "final_battery_cycle", 0.0)
+                    self.degradation_flat_weighted_cycle = getattr(self.prediction, "final_degradation_weighted_cycle", 0.0)
+
                 self.publish_charge_limit(self.charge_limit_best, self.charge_window_best, best=True, soc=self.predict_soc_best)
                 self.publish_export_limit(self.export_window_best, self.export_limits_best, best=True)
 
                 # Compute marginal energy cost matrix (what-if extra load scenarios)
                 self.calculate_marginal_costs()
 
-                # HTML data
+                # Phase 2: Degradation-aware plan comparison (side-by-side, not executed)
+                # Run BEFORE publish_html_plan so both tables are from the same compute cycle.
+                #
+                # THROTTLED: this pass runs a full second optimise_all_windows (with
+                # low-power charging), which roughly triples plan calculation time
+                # (~150s -> ~480s) and pushes the main 5-min loop into permanent
+                # "stale plan" territory.  The degradation plan is display-only (it
+                # does not control the battery), so we only recompute it every
+                # DEGRADATION_COMPARE_INTERVAL_S and reuse the cached degrad_plan_rows/
+                # totals/norm_factor in between.  The flat plan still runs every cycle.
+                DEGRADATION_COMPARE_INTERVAL_S = 30 * 60
+                DEGRADATION_STARTUP_DEFER_S = 10 * 60
+                degrad_now_ts = time.time()
+                degrad_last_ts = getattr(self, "degradation_last_compare_ts", None)
+                # SAFETY: never run the heavy degradation pass on the first cycle after
+                # (re)start.  It once thrashed the host to death, and on restart there is
+                # no throttle history to gate it.  Defer the first pass by
+                # DEGRADATION_STARTUP_DEFER_S (shorter than the recurring interval so the
+                # comparison table appears soon after a restart) by backdating the
+                # baseline; the container resource caps are the hard host safety net.
+                if degrad_last_ts is None:
+                    degrad_last_ts = degrad_now_ts - (DEGRADATION_COMPARE_INTERVAL_S - DEGRADATION_STARTUP_DEFER_S)
+                    self.degradation_last_compare_ts = degrad_last_ts
+                    self.log("Degradation comparison: first pass deferred {:.0f}s after startup".format(DEGRADATION_STARTUP_DEFER_S))
+                degrad_due = (degrad_now_ts - degrad_last_ts) >= DEGRADATION_COMPARE_INTERVAL_S
+                if getattr(self, "degradation_compare_enable", False) and hasattr(self, "degradation_model") and self.degradation_model and not degrad_due:
+                    self.log("Degradation comparison: throttled, reusing cached plan (next recompute in {:.0f}s)".format(DEGRADATION_COMPARE_INTERVAL_S - (degrad_now_ts - degrad_last_ts)))
+                if getattr(self, "degradation_compare_enable", False) and hasattr(self, "degradation_model") and self.degradation_model and degrad_due:
+                    try:
+                        # Save the flat plan's window definitions so we can restore and
+                        # re-render the main table after the degradation pass.
+                        flat_charge_windows = copy.deepcopy(self.charge_window_best)
+                        flat_charge_limits = copy.deepcopy(self.charge_limit_best)
+                        flat_export_windows = copy.deepcopy(self.export_window_best)
+                        flat_export_limits = copy.deepcopy(self.export_limits_best)
+
+                        # Reuse the shared normalisation factor computed above (every
+                        # cycle, from the RAW flat prediction).  Do NOT recompute it here:
+                        # self.prediction is now the NORMALISED flat plan, so dividing its
+                        # battery_cycle by its weighted_cycle would just yield ~1.0.  The
+                        # same factor prices the degradation plan's wear relative to the
+                        # flat plan rather than self-normalising it.
+                        self.log("Degradation comparison: using norm_factor={:.4f}".format(getattr(self, "degradation_norm_factor", 1.0) or 1.0))
+
+                        # --- Degradation-aware pass ---
+                        # Optimise with the degradation-weighted cycle cost AND low-power
+                        # (slow) charging.  Rebuild the prediction so the main-process
+                        # object and the PRED_GLOBAL worker snapshot both carry the
+                        # low-power flag (and norm factor) from a clean cache, then re-fork
+                        # the pool so the worker processes actually inherit them.
+                        self._degradation_optimize = True
+                        self.degradation_compare_low_power = True
+                        self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                        # Cap degradation-pass workers to half the cores so this heavier
+                        # pass leaves host CPU/RAM headroom (it once thrashed the host).
+                        degrad_max_workers = max(1, cpu_count() // 2)
+                        self.recreate_thread_pool(max_processes=degrad_max_workers)
+                        self.log("Degradation comparison: running degradation-aware optimizer with low-power charging ({} workers)".format(degrad_max_workers))
+                        self.optimise_all_windows(best_metric, metric_keep)
+                        # save="best" repopulates predict_*_best, predict_degradation_multiplier_best
+                        # and self.prediction.final_* from the degradation plan.
+                        self.run_prediction(
+                            self.charge_limit_best, self.charge_window_best,
+                            self.export_window_best, self.export_limits_best,
+                            False, save="best", end_record=self.end_record
+                        )
+                        _, degrad_raw = self.publish_html_plan(
+                            pv_forecast_minute_step, pv_forecast_minute10_step,
+                            load_minutes_step, load_minutes_step10, self.end_record,
+                            publish=False
+                        )
+                        self.degrad_plan_rows = degrad_raw.get("rows", [])
+                        self.degrad_plan_totals = degrad_raw.get("totals", {})
+                        dwc = getattr(self, "_degradation_weighted_cycle", 0)
+                        self.log("Degradation comparison: degrade_cycle_cost={:.2f}c".format(dwc * self.metric_battery_cycle))
+
+                        # --- Restore the flat plan ---
+                        # Put the flat windows back, drop the degradation flags, rebuild the
+                        # prediction (flat, non-low-power) and re-run with save="best" so the
+                        # main table renders entirely from flat-plan data (predict_*_best,
+                        # multipliers and self.prediction.final_* all consistent).  The pool
+                        # is torn down at the end of optimise(), so no re-fork is needed here.
+                        self.charge_window_best = flat_charge_windows
+                        self.charge_limit_best = flat_charge_limits
+                        self.export_window_best = flat_export_windows
+                        self.export_limits_best = flat_export_limits
+                        self._degradation_optimize = False
+                        self.degradation_compare_low_power = False
+                        self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                        self.run_prediction(
+                            self.charge_limit_best, self.charge_window_best,
+                            self.export_window_best, self.export_limits_best,
+                            False, save="best", end_record=self.end_record
+                        )
+                        # Record successful recompute time so the pass is throttled
+                        # until the next interval, and stamp the UI "as of" label.
+                        self.degradation_last_compare_ts = degrad_now_ts
+                        self.degradation_last_compare_iso = self.now_utc_real.strftime("%H:%M")
+                    except Exception as e:
+                        self.log("Warn: Degradation comparison failed: {}".format(e))
+                        self.log(traceback.format_exc())
+                        self._degradation_optimize = False
+                        self.degradation_compare_low_power = False
+                        self.degrad_plan_rows = []
+                        self.degrad_plan_totals = {}
+
+                # HTML data — publish both tables together with fresh degradation comparison
                 text = self.short_textual_plan(soc_min, soc_min_minute, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, self.end_record)
                 text_lines = text.split("\n")
                 for line in text_lines:
                     self.log(line)
                 self.publish_html_plan(pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, self.end_record)
+
 
         # Destroy pool
         if self.pool:
@@ -1282,9 +1469,11 @@ class Plan:
         # Self sufficiency metric
         metric += (import_kwh_house + import_kwh_battery) * self.metric_self_sufficiency
 
-        # Adjustment for battery cycles metric — use degradation-weighted if available
-        if degradation_weighted_cycle is not None and getattr(self, "degradation_enable", False) and hasattr(self, "degradation_model") and self.degradation_model:
-            blc = self.degradation_model.baseline_cycle_cost()
+        # Adjustment for battery cycles metric — use degradation-weighted when in degrade optimization mode
+        if getattr(self, "_degradation_optimize", False) and getattr(self, "degradation_model") and self.degradation_model:
+            if degradation_weighted_cycle is None:
+                degradation_weighted_cycle = battery_cycle
+            blc = self.metric_battery_cycle
             metric += degradation_weighted_cycle * blc + metric_keep
         else:
             metric += battery_cycle * self.metric_battery_cycle + metric_keep
@@ -1344,21 +1533,7 @@ class Plan:
             hans.append(self.launch_run_prediction_charge_min_max(best_soc_min, window_n, charge_limit, charge_window, export_window, export_limits, True, all_n, end_record))
             id = 0
             for han in hans:
-                (
-                    cost,
-                    import_kwh_battery,
-                    import_kwh_house,
-                    export_kwh,
-                    soc_min,
-                    soc,
-                    soc_min_minute,
-                    battery_cycle,
-                    metric_keep,
-                    final_iboost,
-                    final_carbon_g,
-                    min_soc,
-                    max_soc,
-                ) = han.get()
+                (cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g, degradation_weighted_cycle, min_soc, max_soc) = han.get()
                 all_min_soc = min(all_min_soc, min_soc)
                 all_max_soc = max(all_max_soc, max_soc)
                 if id == 0:
@@ -1374,6 +1549,7 @@ class Plan:
                         metric_keep,
                         final_iboost,
                         final_carbon_g,
+                        degradation_weighted_cycle,
                     ]
                 elif id == 1:
                     result10[loop_soc] = [
@@ -1388,6 +1564,7 @@ class Plan:
                         metric_keep,
                         final_iboost,
                         final_carbon_g,
+                        degradation_weighted_cycle,
                     ]
                 elif id == 2:
                     resultmid[best_soc_min] = [
@@ -1416,6 +1593,7 @@ class Plan:
                         metric_keep,
                         final_iboost,
                         final_carbon_g,
+                        degradation_weighted_cycle,
                     ]
                 id += 1
 
@@ -1491,11 +1669,19 @@ class Plan:
                 try_charge_limit[window_n] = try_soc
 
             # Simulate with medium PV
-            (cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g) = resultmid[try_soc]
-            (cost10, import_kwh_battery10, import_kwh_house10, export_kwh10, soc_min10, soc10, soc_min_minute10, battery_cycle10, metric_keep10, final_iboost10, final_carbon_g10) = result10[try_soc]
+            try:
+                (cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g, degradation_weighted_cycle) = resultmid[try_soc]
+            except ValueError:
+                (cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g) = resultmid[try_soc]
+                degradation_weighted_cycle = battery_cycle
+            try:
+                (cost10, import_kwh_battery10, import_kwh_house10, export_kwh10, soc_min10, soc10, soc_min_minute10, battery_cycle10, metric_keep10, final_iboost10, final_carbon_g10, degradation_weighted_cycle10) = result10[try_soc]
+            except ValueError:
+                (cost10, import_kwh_battery10, import_kwh_house10, export_kwh10, soc_min10, soc10, soc_min_minute10, battery_cycle10, metric_keep10, final_iboost10, final_carbon_g10) = result10[try_soc]
+                degradation_weighted_cycle10 = battery_cycle10
 
             # Compute the metric from simulation results
-            metric, battery_value = self.compute_metric(end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh)
+            metric, battery_value = self.compute_metric(end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh, degradation_weighted_cycle=degradation_weighted_cycle)
 
             # Metric adjustment based on current charge limit when inside the window
             # to try to avoid constant small changes to SoC target by forcing to keep the current % during a charge period
@@ -1694,23 +1880,44 @@ class Plan:
             start, this_export_limit, hanres, hanres10 = try_option
 
             # Simulate with medium PV
-            cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g = hanres
-            (
-                cost10,
-                import_kwh_battery10,
-                import_kwh_house10,
-                export_kwh10,
-                soc_min10,
-                soc10,
-                soc_min_minute10,
-                battery_cycle10,
-                metric_keep10,
-                final_iboost10,
-                final_carbon_g10,
-            ) = hanres10
+            try:
+                (cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g, degradation_weighted_cycle) = hanres
+            except ValueError:
+                cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g = hanres
+                degradation_weighted_cycle = battery_cycle
+            try:
+                (
+                    cost10,
+                    import_kwh_battery10,
+                    import_kwh_house10,
+                    export_kwh10,
+                    soc_min10,
+                    soc10,
+                    soc_min_minute10,
+                    battery_cycle10,
+                    metric_keep10,
+                    final_iboost10,
+                    final_carbon_g10,
+                    degradation_weighted_cycle10,
+                ) = hanres10
+            except ValueError:
+                (
+                    cost10,
+                    import_kwh_battery10,
+                    import_kwh_house10,
+                    export_kwh10,
+                    soc_min10,
+                    soc10,
+                    soc_min_minute10,
+                    battery_cycle10,
+                    metric_keep10,
+                    final_iboost10,
+                    final_carbon_g10,
+                ) = hanres10
+                degradation_weighted_cycle10 = battery_cycle10
 
             # Compute the metric from simulation results
-            metric, battery_value = self.compute_metric(end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh)
+            metric, battery_value = self.compute_metric(end_record, soc, soc10, cost, cost10, final_iboost, final_iboost10, battery_cycle, metric_keep, final_carbon_g, import_kwh_battery, import_kwh_house, export_kwh, degradation_weighted_cycle=degradation_weighted_cycle)
 
             if this_export_limit == 100.0:
                 # Minor weighting to off
@@ -3331,6 +3538,7 @@ class Plan:
             iboost_running_solar,
             iboost_running_full,
         ) = pred.run_prediction(charge_limit, charge_window, export_window, export_limits, pv10, end_record, save, step)
+        self._degradation_weighted_cycle = getattr(pred, "final_degradation_weighted_cycle", 0.0)
         self.predict_soc = predict_soc
         self.car_charging_soc_next = car_charging_soc_next
         self.iboost_next = iboost_next

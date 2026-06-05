@@ -1634,18 +1634,19 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
                     battery_capacity_kwh=self.get_arg("degradation_battery_capacity", 24.0),
                     capex=self.get_arg("degradation_capex", 1000000),
                     lifetime_cycles=self.get_arg("degradation_lifetime_cycles", 8000),
+                    nominal_c_rate=self.get_arg("degradation_nominal_c_rate", 0),
                 )
                 self.log(
                     "Degradation model enabled: chemistry={}, baseline_cost={:.4f} c/kWh".format(
                         self.degradation_model.chemistry,
-                        self.degradation_model.baseline_cycle_cost(),
+                        getattr(self, "metric_battery_cycle", self.degradation_model.baseline_cycle_cost()),
                     )
                 )
             else:
                 self.degradation_enable = False
                 self.degradation_model = None
             self.degradation_compare_enable = self.degradation_enable and self.args.get("degradation_compare_enable", False)
-            self._use_degradation_metric = False
+            self._degradation_optimize = False
 
         except Exception as e:
             self.log("Error: Exception raised {}".format(e))

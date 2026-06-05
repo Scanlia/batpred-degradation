@@ -6369,7 +6369,7 @@ def get_plan_renderer_js():
             // not 0 which is what a plain hours*60+minutes calculation would return).
             window.planMidnightRef = jsonData.time || null;
 
-            let html = '<table>';
+            let html = '<div style="display:flex; gap:16px; overflow-x:auto; align-items:flex-start"><table>';
             const cellStyle = 'style="padding: 4px;"';
 
             // Render header
@@ -6395,6 +6395,9 @@ def get_plan_renderer_js():
                 html += '<th><b>iBoost kWh</b></th>';
             }
             html += '<th><b>SoC %</b></th>';
+            if (jsonData.degradation_enable) {
+                html += '<th><b>Batt °C</b></th>';
+            }
             html += '<th><b>Cost</b></th>';
             if (jsonData.degradation_enable) {
                 html += '<th><b>Wear x</b></th>';
@@ -6405,12 +6408,6 @@ def get_plan_renderer_js():
             if (jsonData.carbon_enable) {
                 html += '<th><b>CO2 g/kWh</b></th>';
                 html += '<th><b>CO2 kg</b></th>';
-            }
-            if (jsonData.degradation_compare_enable) {
-                html += '<th style=\"border-left:2px solid #90caf9; background:#e3f2fd\"><b> Degrad </b></th>';
-                html += '<th style=\"background:#e3f2fd\"><b>Wear x</b></th>';
-                html += '<th style=\"background:#e3f2fd\"><b>C</b></th>';
-                html += '<th style=\"background:#e3f2fd\"><b>Wear c</b></th>';
             }
 
             html += '</tr>';
@@ -6537,6 +6534,11 @@ def get_plan_renderer_js():
                     html += `<td id=soc bgcolor=${row.soc_color || '#FFFFFF'}>${row.soc_percent}${socSym}</td>`;
                 }
 
+                // Battery temperature
+                if (jsonData.degradation_enable) {
+                    html += `<td id=batt_temp bgcolor=#FFFFFF>${row.battery_temp || '—'}°</td>`;
+                }
+
                 // Cost change
                 const costChange = row.cost_change || 0;
                 let costStr = '';
@@ -6589,37 +6591,6 @@ def get_plan_renderer_js():
                     html += `<td id=total_carbon bgcolor=${row.carbon_color || '#FFFFFF'}>${row.total_carbon || ''}</td>`;
                 }
 
-                // Degradation compare columns (Phase 2 side-by-side)
-                if (jsonData.degradation_compare_enable) {
-                    const wx = row.wear_x;
-                    let wearColor = '#FFFFFF';
-                    if (wx !== undefined && wx > 0) {
-                        if (wx < 0.8) wearColor = '#E8F5E9';
-                        else if (wx < 1.2) wearColor = '#FFFFFF';
-                        else if (wx < 2.0) wearColor = '#FFF8E1';
-                        else if (wx < 3.0) wearColor = '#FFCDD2';
-                        else wearColor = '#EF5350';
-                    }
-                    html += '<td id=degrad_sep style=\"border-left:2px solid #90caf9\" bgcolor=#e3f2fd></td>';
-                    if (wx !== undefined && wx > 0) {
-                        html += `<td id=degrad_wear_x bgcolor=${wearColor}>x${wx.toFixed(2)}</td>`;
-                    } else {
-                        html += '<td id=degrad_wear_x bgcolor=#FFFFFF>-</td>';
-                    }
-                    const cRate = row.wear_c_rate;
-                    if (cRate !== undefined && cRate > 0) {
-                        html += `<td id=degrad_wear_crate bgcolor=#FFFFFF>${cRate.toFixed(2)}C</td>`;
-                    } else {
-                        html += '<td id=degrad_wear_crate bgcolor=#FFFFFF>-</td>';
-                    }
-                    const wc = row.wear_c;
-                    let wcColor = '#FFFFFF';
-                    if (wc >= 20) wcColor = '#FFCDD2';
-                    else if (wc >= 5) wcColor = '#FFCC80';
-                    else if (wc >= 0.5) wcColor = '#FFF8E1';
-                    html += `<td id=degrad_wear_c bgcolor=${wcColor}>${wc.toFixed(2)}c</td>`;
-                }
-
                 html += '</tr>';
             }
 
@@ -6661,7 +6632,12 @@ def get_plan_renderer_js():
                 // SOC percent
                 html += `<td bgcolor=#FFFFFF><b>${totals.soc_percent || ''}</b></td>`;
 
-                // Empty cell for SOC change
+                // Batt °C placeholder (when degradation enabled)
+                if (jsonData.degradation_enable) {
+                    html += '<td></td>';
+                }
+
+                // Cost column placeholder (no per-slot total)
                 html += '<td></td>';
 
                 // Wear x average + wear c total
@@ -6685,20 +6661,117 @@ def get_plan_renderer_js():
                     html += `<td bgcolor=#FFFFFF><b>${totals.total_carbon || ''}</b></td>`;
                 }
 
-                // Degradation compare totals (Phase 2 side-by-side)
-                if (jsonData.degradation_compare_enable) {
-                    const wxAvg = totals.wear_x_avg !== undefined ? totals.wear_x_avg : 0;
-                    const wcTotal = totals.wear_c_total !== undefined ? totals.wear_c_total : 0;
-                    html += '<td bgcolor=#e3f2fd style=\"border-left:2px solid #90caf9\"></td>';
-                    html += `<td bgcolor=#FFFFFF><b>x${wxAvg.toFixed(2)}</b></td>`;
-                    html += '<td bgcolor=#FFFFFF></td>';
-                    html += `<td bgcolor=#FFFFFF><b>${wcTotal.toFixed(1)}c</b></td>`;
-                }
-
                 html += '</tr>';
             }
 
             html += '</table>';
+
+            // Phase 2: Degradation-aware plan comparison table
+            if (jsonData.degrad_rows && jsonData.degrad_rows.length > 0) {
+                const degradRows = jsonData.degrad_rows;
+                const degradTotals = jsonData.degrad_totals || {};
+                // State spans 2 columns (matching the main plan table).  Mirror the main
+                // table's per-cell padding (cellStyle = "padding: 4px") so the degrad rows
+                // are exactly the same height and the two tables line up to the bottom.
+                const dcs = ' style="padding:4px"';
+                html += '<table style="border-collapse:collapse; width:auto; border-left:2px solid #90caf9">';
+                // No separate title row (it offset the degrad data one row below the main
+                // plan table).  In-effect status is shown only by the header background tint
+                // (green when controlling the battery, blue when comparison only) so no
+                // extra text widens the columns.
+                const inEffect = jsonData.degrad_in_effect;
+                const hdrBg = inEffect ? '#c8e6c9' : '#e3f2fd';
+                // Header row (single row, aligns with the main plan table header)
+                html += '<tr>';
+                html += '<th style="background:' + hdrBg + '" colspan=2><b>State</b></th>';
+                html += '<th style="background:' + hdrBg + '"><b>Limit %</b></th>';
+                html += '<th style="background:' + hdrBg + '"><b>SoC %</b></th>';
+                html += '<th style="background:' + hdrBg + '"><b>Cost</b></th>';
+                html += '<th style="background:' + hdrBg + '"><b>Wear x</b></th>';
+                html += '<th style="background:' + hdrBg + '"><b>C</b></th>';
+                html += '<th style="background:' + hdrBg + '"><b>Wear c</b></th>';
+                html += '<th style="background:' + hdrBg + '"><b>Total</b></th>';
+                html += '</tr>';
+                // Render rows with rowspan
+                for (let i = 0; i < degradRows.length; i++) {
+                    const row = degradRows[i];
+                    html += '<tr style="color:black">';
+                    // State (spans 2 cols, or 2 separate cells when split) with rowspan
+                    const sc = row.state_color || '#FFFFFF';
+                    if (!row.skip_state_cell) {
+                        const rowspanAttr = row.rowspan_state > 0 ? ' rowspan=' + row.rowspan_state : '';
+                        const colspanAttr = row.split ? '' : ' colspan=2';
+                        html += '<td' + colspanAttr + rowspanAttr + dcs + ' bgcolor=' + sc + '>' + (row.state_text || row.state || '') + '</td>';
+                        if (row.split && row.state2_text) {
+                            html += '<td' + rowspanAttr + dcs + ' bgcolor=' + (row.state2_color || sc) + '>' + row.state2_text + '</td>';
+                        }
+                    }
+                    // Limit %
+                    if (row.skip_limit_cell) {
+                        // Merged cell - already rendered above
+                    } else if (row.rowspan_limit > 0) {
+                        html += '<td' + dcs + ' bgcolor=#FFFFFF rowspan=' + row.rowspan_limit + '>' + (row.show_limit || '') + '</td>';
+                    } else {
+                        html += '<td' + dcs + ' bgcolor=#FFFFFF>' + (row.show_limit || '') + '</td>';
+                    }
+                    // SoC
+                    const socSym = row.soc_sym || (row.soc_change > 0 ? '&nearr;' : (row.soc_change < 0 ? '&searr;' : '&rarr;'));
+                    html += '<td' + dcs + ' bgcolor=' + (row.soc_color || '#FFFFFF') + '>' + (row.soc_percent != null ? row.soc_percent : '') + socSym + '</td>';
+                    // Cost
+                    const cost = row.cost_change || 0;
+                    let costStr = '&rarr;';
+                    if (cost >= 0.005) costStr = '+' + Math.round(cost*100) + 'c &nearr;';
+                    else if (cost <= -0.005) costStr = '-' + Math.round(Math.abs(cost)*100) + 'c &searr;';
+                    html += '<td' + dcs + ' bgcolor=' + (row.cost_color || '#FFFFFF') + '>' + costStr + '</td>';
+                    // Wear x
+                    const wx = row.wear_x;
+                    if (wx !== undefined && wx > 0) {
+                        let wColor = '#FFFFFF';
+                        if (wx < 0.8) wColor = '#E8F5E9';
+                        else if (wx < 1.2) wColor = '#FFFFFF';
+                        else if (wx < 2.0) wColor = '#FFF8E1';
+                        else if (wx < 3.0) wColor = '#FFCDD2';
+                        else wColor = '#EF5350';
+                        html += '<td' + dcs + ' bgcolor=' + wColor + '>x' + wx.toFixed(2) + '</td>';
+                    } else {
+                        html += '<td' + dcs + ' bgcolor=#FFFFFF>-</td>';
+                    }
+                    // C-rate
+                    const cRate = row.wear_c_rate;
+                    html += '<td' + dcs + ' bgcolor=#FFFFFF>' + (cRate > 0 ? cRate.toFixed(2) + 'C' : '-') + '</td>';
+                    // Wear c
+                    const wc = row.wear_c;
+                    let wcColor = '#FFFFFF';
+                    if (wc >= 20) wcColor = '#FFCDD2';
+                    else if (wc >= 5) wcColor = '#FFCC80';
+                    else if (wc >= 0.5) wcColor = '#FFF8E1';
+                    html += '<td' + dcs + ' bgcolor=' + wcColor + '>' + wc.toFixed(2) + 'c</td>';
+                    // Total (blank if zero)
+                    const total = row.total_cost;
+                    let totalStr = '';
+                    if (typeof total === 'number' && Math.abs(total) >= 0.005) {
+                        totalStr = (total >= 0 ? '' : '-') + jsonData.currency_symbols[0] + Math.abs(total).toFixed(2);
+                    }
+                    html += '<td' + dcs + ' bgcolor=#FFFFFF>' + totalStr + '</td>';
+                    html += '</tr>';
+                }
+                // Totals row: State(2), Limit %, SoC %, Cost (all blank), Wear x, C, Wear c, Total
+                html += '<tr style="color:black">';
+                html += '<td colspan=2' + dcs + '></td><td' + dcs + '></td><td' + dcs + '></td><td' + dcs + '></td>';
+                const wxAvg = degradTotals.wear_x_avg !== undefined ? degradTotals.wear_x_avg : 0;
+                const wcTotal = degradTotals.wear_c_total !== undefined ? degradTotals.wear_c_total : 0;
+                html += '<td' + dcs + ' bgcolor=#FFFFFF><b>x' + wxAvg.toFixed(2) + '</b></td>';
+                html += '<td' + dcs + ' bgcolor=#FFFFFF></td>';
+                html += '<td' + dcs + ' bgcolor=#FFFFFF><b>' + wcTotal.toFixed(1) + 'c</b></td>';
+                const totalCostStr = degradTotals.total_cost >= 0 ?
+                    '' + jsonData.currency_symbols[0] + (degradTotals.total_cost||0).toFixed(2) :
+                    '-' + jsonData.currency_symbols[0] + Math.abs(degradTotals.total_cost||0).toFixed(2);
+                html += '<td' + dcs + ' bgcolor=#FFFFFF><b>' + (Math.abs(degradTotals.total_cost||0) >= 0.005 ? totalCostStr : '') + '</b></td>';
+                html += '</tr>';
+                html += '</table>';
+            }
+
+            html += '</div>';
             return html;
         } catch (error) {
             console.error('Error rendering plan:', error);
