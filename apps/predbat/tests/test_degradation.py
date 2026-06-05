@@ -30,11 +30,16 @@ def test_degradation_baseline_cost():
 
 
 def test_degradation_nominal_conditions():
-    """At 25 C, 0.5C rate, 50% SoC, discharging: multiplier ~1.0."""
+    """At 25 C, nominal C-rate, 50% SoC, discharging: multiplier == 1.0.
+
+    The model is anchored so the reference operating point (discharge at the
+    nominal C-rate, 25 C, 50% SoC) scores exactly 1.0.  This is what makes the
+    degradation-weighted cycle directly comparable to the flat cycle cost.
+    """
     model = DegradationModel(chemistry="LFP", battery_capacity_kwh=24.0, capex=10000, lifetime_cycles=8000)
-    # Simulate a single 5-minute step at nominal conditions
-    delta_kwh = 1.0  # 1 kWh in 5 min = 12 kW = 0.5C on 24 kWh
     delta_hours = 5.0 / 60.0
+    # Throughput that yields exactly the nominal C-rate over this step.
+    delta_kwh = model.nominal_c_rate * model.battery_capacity_kwh * delta_hours
     result = model.compute_step_degradation_multiplier(
         temp_c=25.0,
         soc_percent=50.0,
@@ -42,8 +47,8 @@ def test_degradation_nominal_conditions():
         delta_time_hours=delta_hours,
         is_charging=False,
     )
-    assert 0.5 < result < 2.0, f"Nominal multiplier {result} out of expected range"
-    print("  Nominal (25 C, 0.5C, discharge, 50% SOC): {:.2f}".format(result))
+    assert abs(result - 1.0) < 0.05, f"Nominal multiplier {result} should be ~1.0"
+    print("  Nominal ({:.2f}C discharge, 25 C, 50% SOC): {:.3f}".format(model.nominal_c_rate, result))
 
 
 def test_degradation_high_temperature():
@@ -86,6 +91,53 @@ def test_degradation_charge_vs_discharge_asymmetry():
     print("  Discharge (20 C): {:.2f}, Charge (20 C): {:.2f}".format(discharge_mult, charge_mult))
 
 
+def test_degradation_c_rate_monotonic():
+    """Slower charging must score lower wear than faster charging.
+
+    This is the core lever for nudging the optimiser toward gentle charging:
+    at fixed temperature/SoC the multiplier must increase with C-rate, sit at
+    1.0 at the nominal rate, and be < 1.0 below it.
+    """
+    model = DegradationModel(chemistry="LFP", battery_capacity_kwh=24.0)
+    delta_hours = 5.0 / 60.0
+    cap = model.battery_capacity_kwh
+
+    def mult_at_c(c_rate, is_charging):
+        return model.compute_step_degradation_multiplier(25.0, 50.0, c_rate * cap * delta_hours, delta_hours, is_charging)
+
+    slow = mult_at_c(model.nominal_c_rate * 0.25, True)
+    nominal = mult_at_c(model.nominal_c_rate, True)
+    fast = mult_at_c(model.nominal_c_rate * 3.0, True)
+    assert slow < nominal < fast, f"C-rate not monotonic: slow={slow:.3f} nominal={nominal:.3f} fast={fast:.3f}"
+    # Discharging at the nominal rate is the reference point (== 1.0); charging
+    # at the same rate is higher due to charge/discharge asymmetry.
+    assert nominal > 1.0, f"Charge at nominal {nominal:.3f} should exceed 1.0 (asymmetry)"
+    print("  C-rate sweep (charge): slow={:.3f}  nominal={:.3f}  fast={:.3f}".format(slow, nominal, fast))
+
+
+def test_degradation_condition_multiplier_c_rate_independent():
+    """The displayed condition multiplier ignores C-rate and is ~1.0 at 25 C/50%."""
+    model = DegradationModel(chemistry="LFP", battery_capacity_kwh=24.0)
+    base = model.compute_condition_multiplier(temp_c=25.0, soc_percent=50.0, is_charging=False)
+    assert abs(base - 1.0) < 0.05, f"Condition multiplier at reference should be ~1.0, got {base:.3f}"
+    # It must reflect SoC stress even when no throughput occurs (e.g. idle/freeze slots).
+    high = model.compute_condition_multiplier(temp_c=25.0, soc_percent=95.0, is_charging=False)
+    assert high > base, f"High-SoC condition multiplier {high:.3f} should exceed reference {base:.3f}"
+    print("  Condition multiplier: ref={:.3f}  high-SoC={:.3f}".format(base, high))
+
+
+def test_degradation_nominal_c_rate_override():
+    """Explicit nominal_c_rate overrides the per-chemistry default."""
+    default = DegradationModel(chemistry="LFP")
+    override = DegradationModel(chemistry="LFP", nominal_c_rate=0.5)
+    assert default.nominal_c_rate == CHEMISTRY_PARAMETERS["LFP"]["nominal_c_rate"]
+    assert override.nominal_c_rate == 0.5
+    # A falsy/zero override falls back to the chemistry default.
+    zero = DegradationModel(chemistry="LFP", nominal_c_rate=0)
+    assert zero.nominal_c_rate == default.nominal_c_rate
+    print("  nominal_c_rate: default={}  override={}  zero->default={}".format(default.nominal_c_rate, override.nominal_c_rate, zero.nominal_c_rate))
+
+
 def test_degradation_flow_battery_no_degradation():
     """Flow battery chemistry should have zero degradation multiplier."""
     model = DegradationModel(chemistry="FLOW", battery_capacity_kwh=24.0)
@@ -106,26 +158,34 @@ def test_degradation_chemistry_registry():
 
 
 def test_degradation_high_soc_stress():
-    """SoC stress affects calendar wear, not cycle multiplier.  (Calendar penalty
-    will be a time-shift mechanism in Phase 2 – for now cycle multiplier is
-    SoC-independent.)
-    Verifies that accumulate_wear (stateful) captures the SoC effect."""
-    model1 = DegradationModel(chemistry="LFP", battery_capacity_kwh=24.0)
-    model2 = DegradationModel(chemistry="LFP", battery_capacity_kwh=24.0)
+    """SoC stress factor is now a continuous exponential centred at 50 %.
+    The cycle multiplier increases with SoC deviation, matching literature."""
+    model = DegradationModel(chemistry="LFP", battery_capacity_kwh=24.0)
+
+    # Verify the soc_stress_factor helper
+    assert abs(model.soc_stress_factor(0.5) - 1.0) < 0.001, "Stress at 50% should be ~1.0"
+    high = model.soc_stress_factor(0.95)
+    assert high > 2.0, f"Stress at 95% should be > 2.0, got {high:.2f}"
+
+    # Cycle multiplier at high SoC should be larger than at mid SoC
     delta_kwh = 0.1
     delta_hours = 5.0 / 60.0
+    mid_mul = model.compute_step_degradation_multiplier(25.0, 50.0, delta_kwh, delta_hours, False)
+    high_mul = model.compute_step_degradation_multiplier(25.0, 95.0, delta_kwh, delta_hours, False)
+    assert high_mul > mid_mul * 2.0, f"High-SoC multiplier ({high_mul:.2f}) should be > 2x mid ({mid_mul:.2f})"
 
-    # Stateless multiplier is SoC-independent
-    mid = model1.compute_step_degradation_multiplier(25.0, 50.0, delta_kwh, delta_hours, False)
-    high = model2.compute_step_degradation_multiplier(25.0, 95.0, delta_kwh, delta_hours, False)
-    assert abs(mid - high) < 0.01, f"SoC should not change cycle multiplier: {mid} vs {high}"
-
-    # accumulate_wear does capture SoC effect
+    # accumulate_wear also captures SoC effect (calendar stress)
+    model1 = DegradationModel(chemistry="LFP", battery_capacity_kwh=24.0)
+    model2 = DegradationModel(chemistry="LFP", battery_capacity_kwh=24.0)
     model1.accumulate_wear(25.0, 50.0, delta_kwh, delta_hours, False)
     model2.accumulate_wear(25.0, 95.0, delta_kwh, delta_hours, False)
     assert model2.total_capacity_loss > model1.total_capacity_loss, "Calendar wear should accumulate more at high SoC"
 
-    print("  Cycle multiplier same at both SoCs: {:.2f}".format(mid))
+    # LFP is asymmetric — high-SoC stress exceeds low-SoC stress
+    low_mul = model.compute_step_degradation_multiplier(25.0, 5.0, delta_kwh, delta_hours, False)
+    assert high_mul > low_mul * 1.2, f"High-SoC ({high_mul:.2f}) should exceed low-SoC ({low_mul:.2f}) for LFP"
+
+    print("  Mid stress: {:.2f}  High: {:.2f}  Low: {:.2f}".format(mid_mul, high_mul, low_mul))
     print("  Calendar wear: mid={:.6f}, high={:.6f}".format(model1.total_capacity_loss, model2.total_capacity_loss))
 
 
@@ -141,8 +201,12 @@ def test_degradation_cumulative_time_reduces_rate():
     assert old_battery > 0, "Old battery multiplier should be positive"
 
 
-def run_degradation_tests():
-    """Run all degradation model unit tests."""
+def run_degradation_tests(predbat=None):
+    """Run all degradation model unit tests.
+
+    Accepts an optional predbat instance (passed by the unit_test runner) which
+    the pure-model tests do not need.
+    """
     print("Degradation model tests:")
     tests = [
         ("Baseline LCOS", test_degradation_baseline_cost),
@@ -150,6 +214,9 @@ def run_degradation_tests():
         ("High temperature", test_degradation_high_temperature),
         ("Cold charging plating", test_degradation_cold_charging_plating),
         ("Charge/discharge asymmetry", test_degradation_charge_vs_discharge_asymmetry),
+        ("C-rate monotonic (slow < fast)", test_degradation_c_rate_monotonic),
+        ("Condition multiplier C-rate independent", test_degradation_condition_multiplier_c_rate_independent),
+        ("Nominal C-rate override", test_degradation_nominal_c_rate_override),
         ("Flow battery zero wear", test_degradation_flow_battery_no_degradation),
         ("Chemistry registry", test_degradation_chemistry_registry),
         ("High SoC stress", test_degradation_high_soc_stress),

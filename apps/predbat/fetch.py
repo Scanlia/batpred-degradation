@@ -25,6 +25,7 @@ from const import MINUTE_WATT, PREDICT_STEP, TIME_FORMAT, PREDBAT_MODE_OPTIONS, 
 from predbat_metrics import metrics
 from futurerate import FutureRate
 from axle import fetch_axle_sessions, load_axle_slot, fetch_axle_active
+from degradation import DegradationModel
 
 import copy
 
@@ -1361,26 +1362,38 @@ class Fetch:
 
     def predict_battery_temperature(self, battery_temperature_history, step):
         """
-        Given historical battery temperature data, predict the future temperature
+        Given historical battery temperature data, predict the future temperature.
 
-        For now a fairly simple look back over 24 hours is used, can be improved with outdoor temperature later
+        Uses the multi-day minute-of-day averaged history as a direct forecast,
+        blended with today's current reading.  No cumulative deltas — no drift
+        from past charge/discharge activity polluting today's idle slots.
         """
-
         predicted_temp = {}
-        current_temp = battery_temperature_history.get(0, 20)
         predict_timestamps = {}
+
+        # Current temperature (most recent reading, key 0 = now)
+        current_temp_now = battery_temperature_history.get(0, 20)
+
+        # Overall daily average (fallback for sparse history)
+        temps = list(battery_temperature_history.values())
+        avg_temp = sum(temps) / max(len(temps), 1) if temps else current_temp_now
+
+        minutes_now = getattr(self, "minutes_now", 0)
 
         for minute in range(0, self.forecast_minutes, step):
             timestamp = self.now_utc + timedelta(minutes=minute)
             timestamp_str = timestamp.strftime(TIME_FORMAT)
-            predicted_temp[minute] = dp2(current_temp)
-            predict_timestamps[timestamp_str] = dp2(current_temp)
 
-            # Look at 30 minute change 24 hours ago to predict the up/down trend
-            minute_previous = (24 * 60 - minute) % (24 * 60)
-            change = battery_temperature_history.get(minute_previous, 20) - battery_temperature_history.get(minute_previous + step, 20)
-            current_temp += change
-            current_temp = max(min(current_temp, 30), -20)
+            # Typical temperature at this time of day (multi-day average)
+            minute_of_day = (minutes_now + minute) % (24 * 60)
+            typical = battery_temperature_history.get(minute_of_day, avg_temp)
+
+            # Blend: anchors to today's conditions while capturing diurnal patterns.
+            # For indoor (stable) batteries the blend stays very close to current.
+            # For outdoor batteries the minute-of-day pattern dominates later in the forecast.
+            temp = dp2((current_temp_now + typical) / 2.0)
+            predicted_temp[minute] = temp
+            predict_timestamps[timestamp_str] = temp
 
         self.dashboard_item(
             self.prefix + ".battery_temperature",
@@ -2448,6 +2461,21 @@ class Fetch:
         self.metric_min_improvement_plan = self.get_arg("metric_min_improvement_plan")
         self.metric_min_improvement_export_freeze = self.get_arg("metric_min_improvement_export_freeze")
         self.metric_battery_cycle = self.get_arg("metric_battery_cycle")
+        if self.args.get("degradation_enable", False):
+            self.degradation_enable = True
+            if not self.degradation_model:
+                self.degradation_model = DegradationModel(
+                    chemistry=self.get_arg("degradation_chemistry", "LFP"),
+                    battery_capacity_kwh=self.get_arg("degradation_battery_capacity", 24.0),
+                    capex=self.get_arg("degradation_capex", 1000000),
+                    lifetime_cycles=self.get_arg("degradation_lifetime_cycles", 8000),
+                    nominal_c_rate=self.get_arg("degradation_nominal_c_rate", 0),
+                )
+                self.log("Degradation model enabled: chemistry={}, baseline_cost={:.4f} c/kWh".format(
+                    self.degradation_model.chemistry, getattr(self, "metric_battery_cycle", self.degradation_model.baseline_cycle_cost())))
+        else:
+            self.degradation_enable = False
+            self.degradation_model = None
         self.metric_self_sufficiency = self.get_arg("metric_self_sufficiency")
         self.metric_future_rate_offset_import = self.get_arg("metric_future_rate_offset_import")
         self.metric_future_rate_offset_export = self.get_arg("metric_future_rate_offset_export")

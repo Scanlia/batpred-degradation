@@ -802,6 +802,7 @@ def simple_scenario(
             metric_keep,
             final_iboost,
             final_carbon_g,
+            degradation_weighted_cycle,
         ) = wrapped_run_prediction_single(charge_limit_best, charge_window_best, export_window_best, export_limit_best, pv10, end_record=(my_predbat.end_record), step=5)
     else:
         (

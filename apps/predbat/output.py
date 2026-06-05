@@ -580,6 +580,8 @@ class Output:
         if self.iboost_enable:
             html += "<th><b>iBoost kWh</b></th>"
         html += "<th><b>SoC %</b></th>"
+        if getattr(self, "degradation_enable", False):
+            html += "<th><b>Batt °C</b></th>"
         html += "<th><b>Cost</b></th>"
         if getattr(self, "degradation_enable", False):
             html += "<th><b>Wear x</b></th>"
@@ -589,11 +591,6 @@ class Output:
         if self.carbon_enable:
             html += "<th><b>CO2 g/kWh</b></th>"
             html += "<th><b>CO2 kg</b></th>"
-        if getattr(self, "degradation_compare_enable", False):
-            html += "<th style='border-left:2px solid #90caf9; background:#e3f2fd'><b> Degrad </b></th>"
-            html += "<th style='background:#e3f2fd'><b>Wear x</b></th>"
-            html += "<th style='background:#e3f2fd'><b>C</b></th>"
-            html += "<th style='background:#e3f2fd'><b>Wear c</b></th>"
         html += "</tr>"
         return html
 
@@ -980,6 +977,106 @@ class Output:
 
         return sentence
 
+    @staticmethod
+    def _plan_arrow_ascii(html_sym):
+        """Convert an HTML arrow entity to a single ASCII/unicode arrow for text dumps."""
+        if not html_sym:
+            return " "
+        if "nearr" in html_sym:
+            return "/"
+        if "searr" in html_sym:
+            return "\\"
+        return "-"
+
+    def _format_plan_rows_text(self, rows):
+        """Render a list of plan json rows as an aligned monospaced text table.
+
+        Used by write_plan_debug_text() to produce a human-readable dump of a
+        plan (flat or degradation) for debugging state labels, limits and wear.
+
+        Args:
+            rows: list of json_row dicts (as built in publish_html_plan).
+
+        Returns:
+            A multi-line string.
+        """
+        header = "{:<6} {:<11} {:>5} {:>5} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5} {:>5} {:>5} {:>6} {:>6}".format(
+            "Time", "State", "Lim%", "SoC%", "dSoC", "Imp c", "Exp c", "Costc", "PV", "Load", "Temp", "Wx", "Crate", "Wc"
+        )
+        lines = [header, "-" * len(header)]
+        for row in rows:
+            state = (row.get("state") or "Demand") + self._plan_arrow_ascii(row.get("soc_sym"))
+            cost_c = (row.get("cost_change") or 0.0) * 100.0
+            lines.append(
+                "{:<6} {:<11} {:>5} {:>5} {:>+6.2f} {:>6.1f} {:>6.1f} {:>+6.1f} {:>5.2f} {:>5.2f} {:>5.1f} {:>5.2f} {:>6} {:>6.2f}".format(
+                    str(row.get("time", ""))[11:16],
+                    state[:11],
+                    str(row.get("show_limit", "") or "-"),
+                    "{}".format(row.get("soc_percent", "")),
+                    row.get("soc_change", 0.0) or 0.0,
+                    row.get("import_rate", 0.0) or 0.0,
+                    row.get("export_rate", 0.0) or 0.0,
+                    cost_c,
+                    row.get("pv_forecast", 0.0) or 0.0,
+                    row.get("load_forecast", 0.0) or 0.0,
+                    row.get("battery_temp", 0.0) or 0.0,
+                    row.get("wear_x", 0.0) or 0.0,
+                    ("{:.2f}C".format(row["wear_c_rate"]) if row.get("wear_c_rate") else "-"),
+                    row.get("wear_c", 0.0) or 0.0,
+                )
+            )
+        return "\n".join(lines)
+
+    def write_plan_debug_text(self, flat_raw_plan):
+        """Write a readable text dump of the flat and degradation plans to a file.
+
+        Produces {config_root}/plan_debug.txt with aligned columns for each plan
+        so state labels, limits, SoC, grid flow (Imp/Exp/Cost) and wear can be
+        eyeballed for debugging.  Best-effort: never raises into the caller.
+
+        Args:
+            flat_raw_plan: the raw_plan dict from the final (flat) publish.
+        """
+        try:
+            out = []
+            out.append("Predbat plan debug - generated {}".format(self.now_utc_real.isoformat()))
+            flat_totals = flat_raw_plan.get("totals", {})
+            out.append("")
+            out.append("=== FLAT PLAN (predbat executes this) ===")
+            out.append(
+                "battery_cycle={:.3f}  weighted_cycle={:.3f}  wear={:.1f}c  total={}{:.2f}".format(
+                    flat_totals.get("battery_cycle", 0.0),
+                    flat_totals.get("degradation_weighted_cycle", 0.0),
+                    flat_totals.get("wear_c_total", 0.0),
+                    self.currency_symbols[0],
+                    flat_totals.get("total_cost", 0.0),
+                )
+            )
+            out.append(self._format_plan_rows_text(flat_raw_plan.get("rows", [])))
+
+            degrad_rows = getattr(self, "degrad_plan_rows", []) or []
+            if degrad_rows:
+                degrad_totals = getattr(self, "degrad_plan_totals", {}) or {}
+                out.append("")
+                out.append("=== DEGRADATION-AWARE PLAN (comparison only, not executed) ===")
+                out.append(
+                    "norm_factor={}  battery_cycle={:.3f}  weighted_cycle={:.3f}  wear={:.1f}c  total={}{:.2f}".format(
+                        round(getattr(self, "degradation_norm_factor", 0.0) or 0.0, 4),
+                        degrad_totals.get("battery_cycle", 0.0),
+                        degrad_totals.get("degradation_weighted_cycle", 0.0),
+                        degrad_totals.get("wear_c_total", 0.0),
+                        self.currency_symbols[0],
+                        degrad_totals.get("total_cost", 0.0),
+                    )
+                )
+                out.append(self._format_plan_rows_text(degrad_rows))
+
+            text = "\n".join(out) + "\n"
+            with open(self.config_root + "/plan_debug.txt", "w") as f:
+                f.write(text)
+        except Exception as e:
+            self.log("Warn: write_plan_debug_text failed: {}".format(e))
+
     def publish_html_plan(self, pv_forecast_minute_step, pv_forecast_minute_step10, load_minutes_step, load_minutes_step10, end_record, publish=True, prediction=None):
         """
         Publish the current plan in HTML format
@@ -1040,6 +1137,16 @@ class Output:
         raw_plan["carbon_enable"] = self.carbon_enable
         raw_plan["degradation_enable"] = getattr(self, "degradation_enable", False)
         raw_plan["degradation_compare_enable"] = getattr(self, "degradation_compare_enable", False)
+        raw_plan["degrad_rows"] = getattr(self, "degrad_plan_rows", [])
+        raw_plan["degrad_totals"] = getattr(self, "degrad_plan_totals", {})
+        # Whether the degradation-aware plan is actually controlling the battery.
+        # Currently predbat always executes the flat plan, so this is informational
+        # (the comparison table is shown for evaluation only).  Wire up later.
+        raw_plan["degrad_in_effect"] = getattr(self, "degradation_plan_active", False)
+        # When the degradation comparison was last (re)computed.  The pass is
+        # throttled (it does not run every cycle), so the table may reflect an
+        # earlier snapshot than the flat plan; this lets the UI show "as of HH:MM".
+        raw_plan["degrad_as_of"] = getattr(self, "degradation_last_compare_iso", "")
         raw_plan["manual_load_value"] = self.get_arg("manual_load_value", 0.5)
 
         rate_start = self.midnight_utc
@@ -1183,14 +1290,16 @@ class Output:
             wear_x = 0.0
             wear_c = 0.0
             wear_c_rate = 0.0
+            battery_temp = 0.0
+            mid_soc = soc_percent - (soc_change / self.soc_max * 100.0 / 2.0)
+            is_chg = soc_change > 0
+            if hasattr(self, "battery_temperature_prediction") and self.battery_temperature_prediction:
+                temp_c = self.battery_temperature_prediction.get(minute_start, getattr(self, "battery_temperature", 21))
+            else:
+                temp_c = getattr(self, "battery_temperature", 21)
+            battery_temp = round(temp_c, 1)
             if getattr(self, "degradation_enable", False) and hasattr(self, "degradation_model") and self.degradation_model:
-                mid_soc = soc_percent - (soc_change / self.soc_max * 100.0 / 2.0)
-                is_chg = soc_change > 0
-                if hasattr(self, "battery_temperature_prediction") and self.battery_temperature_prediction:
-                    temp_c = self.battery_temperature_prediction.get(minute_start, getattr(self, "battery_temperature", 21))
-                else:
-                    temp_c = getattr(self, "battery_temperature", 21)
-                blc = self.degradation_model.baseline_cycle_cost()
+                blc = getattr(self, "metric_battery_cycle", self.degradation_model.baseline_cycle_cost())
 
                 # Actual per-step multipliers (includes C-rate) from the prediction simulation
                 if hasattr(self, "predict_degradation_multiplier_best") and self.predict_degradation_multiplier_best:
@@ -1219,12 +1328,7 @@ class Output:
 
                 # Calendar aging cost: always present (battery ages 24/7)
                 soc_d = mid_soc / 100.0
-                if soc_d > 0.8:
-                    cal_stress = 1.0 + math.exp(5.0 * (soc_d - 0.8))
-                elif soc_d < 0.2:
-                    cal_stress = 1.0 + math.exp(5.0 * (0.2 - soc_d))
-                else:
-                    cal_stress = 1.0
+                cal_stress = self.degradation_model.soc_stress_factor(soc_d)
                 cal_temp = math.exp(-24000.0 / (8.314 * (temp_c + 273.15))) / math.exp(-24000.0 / (8.314 * 298.15))
                 calendar_cost = round(0.01 * cal_stress * cal_temp, 2)
                 wear_c = round(wear_c + calendar_cost, 2)
@@ -1610,6 +1714,8 @@ class Output:
             if self.iboost_enable:
                 html += "<td bgcolor=" + iboost_color + ">" + iboost_amount_str + " </td>"
             html += "<td id=soc data-minute=" + str(minute) + " bgcolor=" + soc_color + ">" + str(soc_percent) + soc_sym + "</td>"
+            if getattr(self, "degradation_enable", False):
+                html += "<td id=batt_temp bgcolor=#FFFFFF>" + str(battery_temp) + "°</td>"
             html += "<td id=cost bgcolor=" + cost_color + ">" + str(cost_str) + "</td>"
             if getattr(self, "degradation_enable", False):
                 if wear_x > 0:
@@ -1643,17 +1749,6 @@ class Output:
             if self.carbon_enable:
                 html += "<td id=carbon bgcolor=" + carbon_intensity_color + ">" + str(carbon_intensity) + " </td>"
                 html += "<td id=total_carbon bgcolor=" + carbon_color + "> " + str(carbon_str) + " </td>"
-            if getattr(self, "degradation_compare_enable", False):
-                html += "<td id=degrad_sep bgcolor=#e3f2fd style='border-left:2px solid #90caf9'></td>"
-                if wear_x > 0:
-                    html += "<td id=degrad_wear_x bgcolor=" + wear_x_color + ">x{:.2f}</td>".format(wear_x)
-                else:
-                    html += "<td id=degrad_wear_x bgcolor=#FFFFFF>-</td>"
-                if wear_c_rate > 0:
-                    html += "<td id=degrad_wear_crate bgcolor=#FFFFFF>{:.2f}C</td>".format(wear_c_rate)
-                else:
-                    html += "<td id=degrad_wear_crate bgcolor=#FFFFFF>-</td>"
-                html += "<td id=degrad_wear_c bgcolor=" + wc_color + ">{:.2f}c</td>".format(wear_c)
             html += "</tr>\n"
 
             # Json row
@@ -1732,6 +1827,7 @@ class Output:
                 json_row["iboost_change"] = iboost_change
                 json_row["iboost_color"] = iboost_color
             json_row["soc_percent"] = soc_percent
+            json_row["battery_temp"] = battery_temp
             json_row["soc_change"] = dp2(soc_change)
             json_row["soc_sym"] = soc_sym
             json_row["cost_change"] = dp2(metric_change / 100.0)
@@ -1792,11 +1888,6 @@ class Output:
         if self.carbon_enable:
             carbon_amount_end = self.predict_carbon_best.get(minute_relative_slot_end, carbon_amount)
             html += "<td></td><td bgcolor=#FFFFFF><b>{}</b></td>".format(dp2(carbon_amount_end / 1000.0))
-        if getattr(self, "degradation_compare_enable", False):
-            html += "<td bgcolor=#e3f2fd style='border-left:2px solid #90caf9'></td>"
-            html += "<td bgcolor=#FFFFFF><b>x{:.2f}</b></td>".format(avg_wear_x)
-            html += "<td bgcolor=#FFFFFF></td>"
-            html += "<td bgcolor=#FFFFFF><b>{:.1f}c</b></td>".format(round(degrad_wear_c_total, 1))
         html += "</tr>\n"
         html += "</table>"
         html = html.replace("£", "&#163;")
@@ -1821,8 +1912,16 @@ class Output:
         # Degradation totals
         if getattr(self, "degradation_enable", False):
             if hasattr(self, "degradation_model") and self.degradation_model:
-                raw_plan["degradation_baseline_cost"] = round(self.degradation_model.baseline_cycle_cost(), 4)
-            if hasattr(self, "prediction") and hasattr(self.prediction, "final_degradation_weighted_cycle"):
+                raw_plan["degradation_baseline_cost"] = round(getattr(self, "metric_battery_cycle", self.degradation_model.baseline_cycle_cost()), 4)
+            if publish and hasattr(self, "degradation_flat_battery_cycle"):
+                # Flat (main) table: self.prediction.final_degradation_weighted_cycle has
+                # been clobbered by calculate_marginal_costs' baseline run, so use the
+                # snapshot captured right after the normalised flat re-run.  The degrad
+                # table renders with publish=False while self.prediction is still the fresh
+                # degradation prediction, so it correctly falls through to the live values.
+                totals["degradation_weighted_cycle"] = round(self.degradation_flat_weighted_cycle, 4)
+                totals["battery_cycle"] = round(self.degradation_flat_battery_cycle, 4)
+            elif hasattr(self, "prediction") and hasattr(self.prediction, "final_degradation_weighted_cycle"):
                 totals["degradation_weighted_cycle"] = round(self.prediction.final_degradation_weighted_cycle, 4)
                 totals["battery_cycle"] = round(self.prediction.final_battery_cycle, 4)
             totals["wear_x_avg"] = float("{:.2f}".format(degrad_wear_x_weighted / degrad_throughput_total)) if degrad_throughput_total > 0 else 0.0
@@ -1834,6 +1933,8 @@ class Output:
 
         if publish:
             self.dashboard_item(self.prefix + ".plan_html", state="", attributes={"text": self.text_plan, "html": html, "raw": raw_plan, "friendly_name": "Plan in HTML", "icon": "mdi:web-box"})
+            if getattr(self, "degradation_enable", False):
+                self.write_plan_debug_text(raw_plan)
 
         return html, raw_plan
 
