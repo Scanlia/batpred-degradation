@@ -2984,7 +2984,7 @@ class Output:
             entity_id_list = []
 
         # re-load car charging slots for yesterday (for octopus if enabled).
-        for car_n in range(min(len(entity_id_list), self.num_cars)):
+        for car_n in range(min(len(entity_id_list), self.num_cars, len(self.octopus_slots))):
             self.car_charging_slots[car_n] = self.load_octopus_slots(car_n, self.octopus_slots[car_n], self.octopus_intelligent_consider_full)
 
         # re-construct car charging slots from non-octopus using the car energy sensor
@@ -3128,16 +3128,19 @@ class Output:
                 cost_value += cost_yesterday
             cost_yesterday_array[minute] = cost_value
 
-        # Get battery level yesterday
-        battery_today_data = self.get_history_wrapper(entity_id=self.prefix + ".soc_kw_h0", days=2, required=False)
-        if not battery_today_data:
-            self.log("Warn: Calculate yesterday: No soc_kw_h0 data for yesterday")
-            return
-        battery_data, _ = minute_data(battery_today_data[0], 2, self.now_utc, "state", "last_updated", backwards=True, clean_increment=False, smoothing=False, divide_by=1.0, scale=1.0)
-        battery_soc_yesterday = battery_data.get(minutes_back, 0.0)
+        # Get battery level yesterday - prefer the already-fetched in-memory history, fall back to HA query
+        battery_data = self.soc_kwh_history
+        if not battery_data:
+            battery_today_data = self.get_history_wrapper(entity_id=self.prefix + ".soc_kw_h0", days=2, required=False)
+            if battery_today_data:
+                battery_data, _ = minute_data(battery_today_data[0], 2, self.now_utc, "state", "last_updated", backwards=True, clean_increment=False, smoothing=False, divide_by=1.0, scale=1.0)
+            else:
+                self.log("Info: Calculate yesterday: No soc_kw_h0 history available, using saved soc value as fallback")
+                battery_data = {}
+        battery_soc_yesterday = battery_data.get(minutes_back, soc_yesterday)
         battery_soc_yesterday_array = {}
         for minute in range(0, end_record + self.minutes_now):
-            battery_soc_yesterday_array[minute] = battery_data.get(minutes_back + 24 * 60 - minute - 5, 0.0)  # -5 gives 4 minutes into new data to allow for reset
+            battery_soc_yesterday_array[minute] = battery_data.get(minutes_back + 24 * 60 - minute - 5, soc_yesterday)  # -5 gives 4 minutes into new data to allow for reset
 
         # Get status history
         predbat_status_data = self.get_history_wrapper(entity_id=self.prefix + ".status", days=2, required=False)
@@ -3501,7 +3504,6 @@ class Output:
         self.export_today_now = export_today_now
         self.carbon_today_sofar = carbon_today_sofar
         self.pv_today_now = pv_today_now
-        self.soc_kw = soc_kw
         self.car_charging_hold = car_charging_hold
         self.iboost_energy_subtract = iboost_energy_subtract
         self.load_minutes_now = load_minutes_now

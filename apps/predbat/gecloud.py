@@ -248,7 +248,7 @@ class GECloudDirect(ComponentBase):
         self.evc_devices_dict = {}
         self.evc_device_list = []
         self.settings_from_cache = False
-        self.default_options_done = False
+        self.default_options_stamp = None
 
         # API request metrics for monitoring
         self.requests_total = 0
@@ -604,6 +604,8 @@ class GECloudDirect(ComponentBase):
                         self.dashboard_item(entity_name + "_grid_export_total", state=meter[key][subkey].get("export", 0), attributes=attribute_table.get("grid_export_total", {}), app="gecloud")
 
     async def enable_default_options(self, device, registers):
+        """Enable default options for the device."""
+        changed = False
         for key in registers:
             reg_name = registers[key].get("name", "")
             value = registers[key].get("value", None)
@@ -616,10 +618,9 @@ class GECloudDirect(ComponentBase):
                     if result and ("value" in result):
                         registers[key]["value"] = result["value"]
                         await self.publish_registers(device, self.settings[device], select_key=key)
-                        return True
+                        changed = True
                     else:
                         self.log("GECloud: Warn: Failed to set {} for {}".format(ha_name, device))
-                        return False
             if ("inverter_max_output_active_power_percent" in ha_name) or ("ac_charge_upper_percent_limit" in ha_name) or ("_upper_soc_percent_limit" in ha_name):
                 if "enable_" in ha_name:
                     continue
@@ -630,10 +631,9 @@ class GECloudDirect(ComponentBase):
                     if result and ("value" in result):
                         registers[key]["value"] = result["value"]
                         await self.publish_registers(device, self.settings[device], select_key=key)
-                        return True
+                        changed = True
                     else:
                         self.log("GECloud: Warn: Failed to set {} for {}".format(ha_name, device))
-                        return False
             if "charge_up_to_percent" in ha_name:
                 if not value or value < 100:
                     self.log("GECloud: Setting {} to 100% for {}, previous value was {}".format(ha_name, device, value))
@@ -641,10 +641,9 @@ class GECloudDirect(ComponentBase):
                     if result and ("value" in result):
                         registers[key]["value"] = result["value"]
                         await self.publish_registers(device, self.settings[device], select_key=key)
-                        return True
+                        changed = True
                     else:
                         self.log("GECloud: Warn: Failed to set {} for {}".format(ha_name, device))
-                        return False
             if "discharge_down_to_percent" in ha_name:
                 if not value or value > 4:
                     self.log("GECloud: Setting {} to 4% for {}, previous value was {}".format(ha_name, device, value))
@@ -652,10 +651,9 @@ class GECloudDirect(ComponentBase):
                     if result and ("value" in result):
                         registers[key]["value"] = result["value"]
                         await self.publish_registers(device, self.settings[device], select_key=key)
-                        return True
+                        changed = True
                     else:
                         self.log("GECloud: Warn: Failed to set {} for {}".format(ha_name, device))
-                        return False
             # Reset AC charge start and end times to 00:00 to disable
             for charge_id in range(2, 11):
                 if (
@@ -670,25 +668,27 @@ class GECloudDirect(ComponentBase):
                         if result and ("value" in result):
                             registers[key]["value"] = result["value"]
                             await self.publish_registers(device, self.settings[device], select_key=key)
-                            return True
+                            changed = True
                         else:
                             self.log("GECloud: Warn: Failed to set {} for {}".format(ha_name, device))
-                            return False
             if "real_time_control" in ha_name:
+                if self.ems_device:
+                    # RTC is on the EMS, not the individual inverters — skip
+                    continue
                 if value:
                     self.log("GECloud: Real-time control already enabled for {}".format(device))
-                    return True
+                    changed = True
+                    continue
                 else:
                     self.log("GECloud: Enabling real-time control for {} as current value is {}".format(device, value))
                 result = await self.async_write_inverter_setting(device, key, True)
                 if result and ("value" in result):
                     registers[key]["value"] = result["value"]
                     await self.publish_registers(device, self.settings[device], select_key=key)
-                    return True
+                    changed = True
                 else:
                     self.log("GECloud: Warn: Failed to enable real-time control for {}".format(device))
-                    return False
-        return False
+        return changed
 
     async def publish_registers(self, device, registers, select_key=None):
         """
@@ -793,6 +793,7 @@ class GECloudDirect(ComponentBase):
         batteries = devices["battery"]
         batteries_real = devices["battery"]
         num_inverters = len(batteries)
+        pvs = devices.get("pv", [])
 
         if not devices["ems"] and devices["gateway"] and len(batteries) > 1:
             # Only use gateway as main control if we have multiple batteries
@@ -856,12 +857,10 @@ class GECloudDirect(ComponentBase):
             self.set_arg("load_today", [f"sensor.{self.prefix}_gecloud_{device}_consumption_total" for device in batteries])
         self.set_arg("import_today", [f"sensor.{self.prefix}_gecloud_{device}_grid_import_total" for device in batteries])
         self.set_arg("export_today", [f"sensor.{self.prefix}_gecloud_{device}_grid_export_total" for device in batteries])
-        self.set_arg("pv_today", [f"sensor.{self.prefix}_gecloud_{device}_solar_total" for device in batteries])
         self.set_arg("charge_rate", build_entities("number", ["battery_charge_power"]))
         self.set_arg("battery_rate_max", [f"sensor.{self.prefix}_gecloud_{device}_max_charge_rate" for device in batteries])
         self.set_arg("discharge_rate", build_entities("number", ["battery_discharge_power"]))
         self.set_arg("battery_power", [f"sensor.{self.prefix}_gecloud_{device}_battery_power" for device in batteries])
-        self.set_arg("pv_power", [f"sensor.{self.prefix}_gecloud_{device}_solar_power" for device in batteries])
         self.set_arg("load_power", [f"sensor.{self.prefix}_gecloud_{device}_consumption_power" for device in batteries])
         self.set_arg("grid_power", [f"sensor.{self.prefix}_gecloud_{device}_grid_power" for device in batteries])
         self.set_arg("soc_percent", [f"sensor.{self.prefix}_gecloud_{device}_battery_percent" for device in batteries])
@@ -879,6 +878,9 @@ class GECloudDirect(ComponentBase):
         self.set_arg("battery_temperature", [f"sensor.{self.prefix}_gecloud_{device}_battery_temperature" for device in batteries])
         self.set_arg("battery_scaling", [f"sensor.{self.prefix}_gecloud_{device}_battery_dod_soh" for device in batteries])
         self.set_arg("inverter_limit", [f"sensor.{self.prefix}_gecloud_{device}_max_inverter_rate" for device in batteries])
+
+        self.set_arg("pv_today", [f"sensor.{self.prefix}_gecloud_{device}_solar_total" for device in batteries + pvs])
+        self.set_arg("pv_power", [f"sensor.{self.prefix}_gecloud_{device}_solar_power" for device in batteries + pvs])
 
         if len(batteries):
             self.set_arg("battery_temperature_history", f"sensor.{self.prefix}_gecloud_{batteries[0]}_battery_temperature")
@@ -919,11 +921,20 @@ class GECloudDirect(ComponentBase):
             all_meter_serials = []
             for bat in batteries:
                 all_meter_serials.extend(battery_meters.get(bat, []))
-            no_dedicated_meters = len(all_meter_serials) == 0
             has_duplicate_serials = len(all_meter_serials) != len(set(all_meter_serials))
-            has_shared_ct = no_dedicated_meters or has_duplicate_serials
+            has_shared_ct = False
+            if has_duplicate_serials:
+                has_shared_ct = True
+                reason = "duplicate meter serials"
+            else:
+                reason = "meters are not duplicated"
+            if self.get_arg("ge_cloud_automatic_split_ct", default=False):
+                has_shared_ct = False
+                reason = "split CT override"
+            elif self.get_arg("ge_cloud_automatic_shared_ct", default=False):
+                has_shared_ct = True
+                reason = "shared CT override"
             if has_shared_ct:
-                reason = "no dedicated meters" if no_dedicated_meters else "duplicate meter serials"
                 self.log("GECloud: Multiple inverters sharing a single CT clamp detected ({}) — using first inverter only for grid and load measurements".format(reason))
                 self.set_arg("grid_power", [f"sensor.{self.prefix}_gecloud_{batteries[0]}_grid_power"] + [0 for _ in range(num_inverters - 1)])
                 self.set_arg("load_power", [f"sensor.{self.prefix}_gecloud_{batteries[0]}_consumption_power"] + [0 for _ in range(num_inverters - 1)])
@@ -931,6 +942,8 @@ class GECloudDirect(ComponentBase):
                 self.set_arg("export_today", [f"sensor.{self.prefix}_gecloud_{batteries[0]}_grid_export_total"])
                 if not self.get_arg("ge_cloud_load_today_ignore", default=False):
                     self.set_arg("load_today", [f"sensor.{self.prefix}_gecloud_{batteries[0]}_consumption_total"])
+            else:
+                self.log("GECloud: Multiple inverters detected, using all inverters for grid and load measurements ({})".format(reason))
 
         # reconfigure for EMS
         if devices["ems"]:
@@ -990,7 +1003,7 @@ class GECloudDirect(ComponentBase):
 
             # Build a list of devices to poll:
             # Use all battery inverter serials and also add the EMS device if it's distinct.
-            self.device_list = self.devices_dict["battery"][:]
+            self.device_list = self.devices_dict["battery"][:] + self.devices_dict["pv"][:]
 
             self.ems_device = None
             if self.devices_dict["ems"]:
@@ -1001,11 +1014,11 @@ class GECloudDirect(ComponentBase):
                     self.device_list.append(self.ems_device)
 
             self.gateway_device = None
-            if not self.ems_device and self.devices_dict["gateway"] and len(self.device_list) > 1:
+            if not self.ems_device and self.devices_dict["gateway"] and len(self.devices_dict["battery"]) > 1:
                 self.gateway_device = self.devices_dict["gateway"]
                 self.log("GECloud: Found Gateway device {} and multiple batteries, using only the gateway device".format(self.gateway_device))
-                self.device_list = [self.gateway_device]
-            elif not self.ems_device and self.devices_dict["gateway"] and len(self.device_list) == 1:
+                self.device_list = [self.gateway_device] + self.devices_dict["pv"][:]
+            elif not self.ems_device and self.devices_dict["gateway"] and len(self.devices_dict["battery"]) <= 1:
                 self.log("GECloud: Found Gateway device {} but only one battery, using the battery device for polling".format(self.devices_dict["gateway"]))
 
             self.evc_device_list = []
@@ -1093,8 +1106,10 @@ class GECloudDirect(ComponentBase):
                 if self.automatic:
                     await self.async_automatic_config(self.devices_dict)
 
-            if not self.default_options_done and self.get_state_wrapper(f"switch.{self.prefix}_set_read_only", default="off") != "on":
-                self.default_options_done = True
+            now_utc = self.now_utc_exact
+            options_due = self.default_options_stamp is None or (now_utc - self.default_options_stamp) >= timedelta(hours=24)
+            if options_due and self.get_state_wrapper(f"switch.{self.prefix}_set_read_only", default="off") != "on":
+                self.default_options_stamp = now_utc
                 for device in self.device_list:
                     await self.enable_default_options(device, self.settings[device])
 
@@ -1482,7 +1497,7 @@ class GECloudDirect(ComponentBase):
         """
 
         device_list = await self.async_get_inverter_data_retry(GE_API_DEVICES)
-        result = {"gateway": None, "ems": None, "battery": [], "battery_meters": {}}
+        result = {"gateway": None, "ems": None, "battery": [], "battery_meters": {}, "pv": []}
         if device_list is None:
             return result
 
@@ -1490,7 +1505,7 @@ class GECloudDirect(ComponentBase):
             self.log("GECloud: Found device {}".format(device))
             inverter = device.get("inverter", {}) or {}
             serial = inverter.get("serial", None)
-            # last_updated = inverter.get("last_updated", None)
+            last_updated = inverter.get("last_updated", None)
             info = inverter.get("info", {}) or {}
             model = info.get("model", "").lower()
             # battery = info.get("battery_type", {})
@@ -1499,10 +1514,21 @@ class GECloudDirect(ComponentBase):
             meter_serials = [m.get("serial_number") for m in meters if m.get("serial_number") is not None]
             if serial:
                 serial = serial.lower()
+                if last_updated:
+                    try:
+                        updated_dt = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+                        age_days = (datetime.now(timezone.utc) - updated_dt).days
+                        if age_days > 5:
+                            self.log("GECloud: Warn: Skipping device {} as last_updated {} is {} days ago (>5), assuming non-functional".format(serial, last_updated, age_days))
+                            continue
+                    except (ValueError, TypeError):
+                        self.log("GECloud: Warn: Could not parse last_updated {} for device {}, skipping age check".format(last_updated, serial))
                 if "plant ems" in model:
                     result["ems"] = serial
                 elif "gateway" in model or "gw2" in model:
                     result["gateway"] = serial
+                elif "giv-pv" in model:
+                    result["pv"].append(serial)
                 elif batteries or info.get("battery"):
                     result["battery"].append(serial)
                     result["battery_meters"][serial] = meter_serials

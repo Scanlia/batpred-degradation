@@ -93,6 +93,11 @@ Note: Combining export slots may prevent optimal forced export. Combining charge
 The number of CPU threads you use can change your performance, you can set **threads** in `apps.yaml` to 0 to disable threading if you don't have multiple CPUs available,
 or set it to 'auto' (the default) to use one thread per CPU. It is recommended you don't set this to an odd number of threads.
 
+Predbat has a compiled C++ prediction kernel that can give a significant speedup to planning with identical results.
+It is On by default but if it fails to load on your architecture you may want to look at why.
+
+See [prediction_kernel_enable](apps-yaml.md#prediction_kernel_enable) for details.
+
 ## Battery loss options
 
 **input_number.predbat_battery_loss** is an assumed percentage figure for energy lost when charging the battery, the default 0.03 is 3%.
@@ -265,6 +270,10 @@ When Off export slots are sorted just by decreasing export price and then time (
 
 By default with this option On the latest export slots of the same value will be picked, this is useful for fixed-price export tariffs where you want to export as late in the day as you can, thus preserving the battery for as long as possible.
 
+**switch.predbat_export_more_solar** When turned On, late in the planning stage Predbat will try enabling Freeze Export on every otherwise Idle slot that has predicted solar generation. With Freeze Export the battery is not charged from the surplus solar, so that solar is exported to the grid instead.
+
+This alternative plan is only kept if it does not increase the overall plan metric by more than **input_number.predbat_export_more_solar_threshold** (_expert mode_, default 1p), otherwise the original plan is restored. This lets you favour exporting solar over storing it when doing so is roughly cost-neutral. The feature relies on **switch.predbat_set_export_freeze** being enabled (and your inverter supporting export/discharge freeze); it is an optimiser-only setting and uses the existing Freeze Export execution behaviour.
+
 ## Battery margins and metrics options
 
 **input_number.predbat_best_soc_keep** is the minimum battery level in kWh that Predbat will to try to keep the battery above for the Predbat plan.
@@ -369,6 +378,7 @@ Set the list of [devices to notify](apps-yaml.md#notify_devices) in `apps.yaml`.
 lowest possible rate to meet the charge target. This is only really effective for charge windows longer than a single slot.
 If this setting is turned on, it is strongly recommended that you create a [battery_power_charge_curve in apps.yaml](apps-yaml.md#battery-chargedischarge-curves)
 as otherwise the low power charge may not reach the charge target in time.
+The minimum requested charge rate used in this mode is 400 watts (subject to inverter/battery minimum rate limits).
 This setting is off by default.
 
 The YouTube video [low power charging and charging curve](https://youtu.be/L2vY_Vj6pQg?si=0ZiIVrDLHkeDCx7h)
@@ -592,13 +602,18 @@ Whilst the holiday days left are non-zero, Predbat's 'holiday mode' is active.
 
 When Predbat is in 'Demand' mode (i.e. not actively charging or discharging) and 'holiday mode' is active, Predbat's status will show as 'Demand (Holiday)'.
 
-When Predbat's 'holiday mode' is active the historical load data will be taken from yesterday's data (1 day ago) rather than from the **days_previous** setting in `apps.yaml`.
+With `days_previous_auto` enabled (the default), holiday mode is instead accounted for automatically by the
+weighted-bucket forecast, which down-weights historical days whose holiday mode state doesn't match today's.
+
+In this case just set holiday mode for the days you are away and Predbat does the rest.
+
+### Holiday mode with days_previous_auto off
+
+If [days_previous_auto](apps-yaml.md#days_previous_auto-weighted-historical-load-forecast) is disabled, when Predbat's 'holiday mode' is active the historical load data will be taken from yesterday's data (1 day ago) rather than from the **days_previous** setting in `apps.yaml`.
 This means Predbat will adjust more quickly to the new usage pattern.
 
 If you have been away for a longer period (more than your normal days_previous setting) then obviously it's going
 to take longer for the historical data to catch up, you could then enable holiday mode for another 7 days after your return.
-
-In summary:
 
 - For short holidays set holiday_days_left to the number of full days you are away, including today but excluding the return day
 - For longer holidays set holiday_days_left to the number of days you are away plus another 7 days until the data catches back up

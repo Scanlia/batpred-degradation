@@ -13,7 +13,7 @@ To setup the inverter with Predbat you will need to:
 3. Confirm that the integration is working.  Are you receiving data from the various sensors (grid energy, charge limit, solar PV generated, etc)?<BR>
    Can you control the inverter using its Home Assistant controls?
 
-4. For each inverter there is a custom `apps.yaml` template configuration file that must be used in place of the GivTCP template file installed by default with Predbat:
+4. For most inverters there is a custom `apps.yaml` template configuration file that must be used in place of the GivTCP template file installed by default with Predbat:
 
    - Open the inverter-specific template file with a browser
    - Using a [file editor in Home Assistant](install.md#editing-configuration-files-in-home-assistant), edit the default `apps.yaml` configuration file
@@ -31,7 +31,7 @@ To setup the inverter with Predbat you will need to:
 The table below lists the inverters and required Home Assistant integrations that have had Predbat configurations developed.
 
 Additionally, if your inverter type is not listed, you can create a [custom inverter definition for Predbat](#i-want-to-add-an-unsupported-inverter-to-predbat).
-Once you get everything working please share the configuration as a github issue so it can be incorporated into the Predbat documentation.
+Once you get everything working please share the configuration as a GitHub issue so it can be incorporated into the Predbat documentation.
 
    | Name | Integration | Template |
    | :---------------------------- | :------------- | :------------ |
@@ -47,6 +47,7 @@ Once you get everything working please share the configuration as a github issue
    | [Kostal Plenticore](#kostal-plenticore) | [Kostal Plenticore](https://www.home-assistant.io/integrations/kostal_plenticore) | [kostal.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/kostal.yaml) |
    | [LuxPower](#luxpower) | [LuxPython](https://github.com/guybw/LuxPython_DEV) | [luxpower.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/luxpower.yaml) |
    | [SigEnergy](#sigenergy-sigenstor) | [SigEnergy](https://github.com/TypQxQ/Sigenergy-Home-Assistant-Integration) | [sigenergy_sigenstor.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/sigenergy_sigenstor.yaml) |
+   | [SigEnergy Cloud](#sigenergy-cloud) | Predbat built-in | [sigenergy_cloud.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/sigenergy_cloud.yaml) |
    | [Sofar inverters](#sofar-inverters) | [Sofar MQTT integration](https://github.com/cmcgerty/Sofar2mqtt) | [sofar.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/sofar.yaml) |
    | [SolarEdge inverters](#solaredge-inverters) | [Solaredge Modbus Multi](https://github.com/WillCodeForCats/solaredge-modbus-multi) | [solaredge.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/solaredge.yaml) |
    | [Solax Cloud](#solax-cloud) | Predbat | [solax_cloud.yaml](https://raw.githubusercontent.com/springfall2008/batpred/refs/heads/main/templates/solax_cloud.yaml) |
@@ -491,63 +492,64 @@ Growatt has two popular series of inverters, SPA and SPH. Copy the template that
 
 ## Huawei
 
-The discussion ticket is here: <https://github.com/springfall2008/batpred/issues/684>
+Copy the Huawei template over your existing `apps.yaml` and modify all entity IDs, battery capacity and power limits for your own system:
 
-- Please copy the template <https://github.com/springfall2008/batpred/blob/main/templates/huawei.yaml> over the top of your `apps.yaml`, and modify it for your system
+<https://github.com/springfall2008/batpred/blob/main/templates/huawei.yaml>
 
-- Ensure you set **input_number.predbat_set_reserve_min** to the minimum value for your system which may be 12%
+Configure the Huawei inverter operating mode according to your installation. The example setup linked below has been tested using **Maximise self-consumption**.
 
-- Huawei inverters can charge the battery from DC solar and discharge at one power level (e.g. 5kWh), but have a lower limit (e.g. 3kWh) for AC charging.
-  At present Predbat doesn't have the ability to model separate DC and AC charging limits,
-  so battery_rate_max is set to the lower limit in watts (e.g. 3000) in the template `apps.yaml` to ensure that Predbat correctly plans AC charging of the battery at the right rate.
+Set `input_number.predbat_set_reserve_min` to a suitable minimum value for your battery system. This may be 12%, but some installations use a lower reserve.
 
-- However this means Predbat will also limit DC solar charging to this lower limit and to avoid that an automation is used to overwrite the **inverter_limit_charge** during the hours of sunrise and sunset:
+Huawei systems may have different limits for AC grid charging, DC solar charging and battery discharge. Predbat can model these separately:
 
 ```yaml
-alias: Predbat change inverter charge rate at sunrise and sunset
-description: Using predbat_manual_api
-triggers:
-    - trigger: time
-    at:
-      entity_id: sensor.sun_next_rising
-    id: sunrise
-    - trigger: time
-    at:
-      entity_id: sensor.sun_next_setting
-    id: sunset
-conditions: []
-actions:
-    - choose:
-      - conditions:
-          - condition: trigger
-            alias: Sunrise
-            id:
-              - sunrise
-        sequence:
-          - action: select.select_option
-            alias: set inverter charge rate to 5000W at sunrise for maximum DC solar charging
-            target:
-              entity_id:
-                - select.predbat_manual_api
-            data:
-              option: inverter_limit_charge(0)=5000
-      - conditions:
-          - condition: trigger
-            alias: Sunset
-            id:
-              - sunset
-        sequence:
-          - action: select.select_option
-            alias: set inverter charge rate to 1500W at sunset for reduced AC charging rate
-            target:
-              entity_id:
-                - select.predbat_manual_api
-            data:
-              option: inverter_limit_charge(0)=3000
-mode: single
+  inverter_limit:
+  - 11000
+
+  battery_rate_max:
+  - 5000
+
+  inverter_limit_charge:
+  - 5000
+
+  inverter_limit_discharge:
+  - 5000
+
+  inverter_limit_charge_dc:
+  - 5000
 ```
 
-- Set the Huawei inverter work mode to 'TOU' (Time Of Use).
+All values are in watts.
+
+The tested Huawei Solar setup uses:
+
+```yaml
+  charge_start_service:
+    service: huawei_solar.forcible_charge_soc
+    device_id: YOUR_HUAWEI_DEVICE_ID
+    target_soc: "{target_soc}"
+    power: "{power}"
+
+  charge_stop_service:
+    service: huawei_solar.stop_forcible_charge
+    device_id: YOUR_HUAWEI_DEVICE_ID
+
+  discharge_start_service:
+    service: huawei_solar.forcible_discharge_soc
+    device_id: YOUR_HUAWEI_DEVICE_ID
+    target_soc: "{target_soc}"
+    power: "{power}"
+
+  discharge_stop_service:
+    service: huawei_solar.stop_forcible_charge
+    device_id: YOUR_HUAWEI_DEVICE_ID
+```
+
+Start in Monitor or Read Only mode and test all Huawei service calls manually before enabling active control.
+
+A more complete working example, including Home Assistant package sensors, EV charging and Manual API automations, is available here:
+
+<https://github.com/JohanAlvedal/Predbat-setup>
 
 ## Kostal Plenticore
 
@@ -1710,9 +1712,120 @@ so you may need to adapt the above automations and `apps.yaml` (or rename your e
 *Important:* Depending upon your electricity supply, you may need to change where **number.sigen_plant_grid_import_limitation** is set to 100 in the first integration to any lower import limit that your electricity supplier may have imposed,
 e.g. 18kW roughly corresponds to an 80A supply.
 
-## Sofar Inverters
+## Sigenergy Cloud
 
-For this integration, the key elements are:
+**Experimental**
+
+Predbat has a built-in Sigenergy Cloud integration that connects directly to the Sigenergy OpenAPI and MQTT broker — no local Home Assistant integration is required.
+It publishes all necessary sensor entities itself and can automatically configure Predbat to use them.
+
+See the [Components - Sigenergy Cloud](components.md#sigenergy-cloud-api-sigenergy) documentation for full configuration options.
+
+### Obtaining Sigenergy Cloud API credentials
+
+1. Log in to the [Sigenergy Developer Portal](https://developer.sigencloud.com).
+
+2. Create a new application (if you do not already have one):
+   - Give it a descriptive name, e.g. *PredBat home battery prediction*
+   - Make sure you tick **VPP Mode** — this is required for Predbat to send charge and discharge commands
+
+3. Submit the application for approval. Approval may take a few days.
+
+4. Once approved, go to **Dashboard → (your application) → Settings**.
+
+5. Copy the **App Key** shown on the settings page.
+
+6. Click **Reset** next to App Secret and copy the secret that is displayed.
+   **Save it immediately** — it will not be shown again.
+
+7. Go to **Data Subscription → MQTT Certificates** (expand the section).
+
+8. Download all three certificate files:
+   - **CA Certificate** (`.pem`)
+   - **Client Certificate** (`.pem`)
+   - **Client Key** (`.key` or `.pem`)
+
+### Storing credentials in secrets.yaml
+
+The certificate files contain multi-line PEM text. YAML supports multi-line strings with the `|` (literal block scalar) syntax — each line of the certificate must be indented consistently below the key name.
+
+Add the following to your `secrets.yaml`:
+
+```yaml
+sigenergy_app_key: "your-app-key-here"
+sigenergy_app_secret: "your-app-secret-here"
+
+sigenergy_ca_pem: |
+  -----BEGIN CERTIFICATE-----
+  ... note entire key must be indented 2 spaces
+  -----END CERTIFICATE-----
+
+sigenergy_client_pem: |
+  -----BEGIN CERTIFICATE-----
+  ... note entire key must be indented 2 spaces
+  -----END CERTIFICATE-----
+
+sigenergy_client_key: |
+  -----BEGIN RSA PRIVATE KEY-----
+  ... note entire key must be indented 2 spaces
+  -----END RSA PRIVATE KEY-----
+```
+
+### Configuring apps.yaml
+
+Copy the template [sigenergy_cloud.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/sigenergy_cloud.yaml) over your `apps.yaml` and configure the Sigenergy Cloud component section:
+
+```yaml
+  sigenergy_app_key: !secret sigenergy_app_key
+  sigenergy_app_secret: !secret sigenergy_app_secret
+  sigenergy_ca_pem: !secret sigenergy_ca_pem
+  sigenergy_client_pem: !secret sigenergy_client_pem
+  sigenergy_client_key: !secret sigenergy_client_key
+  sigenergy_automatic: true
+  sigenergy_system_id:
+    - "YOUR_SYSTEM_ID"
+```
+
+You must set at least one system ID as it is required to onboard your system.
+The System ID can be found in the **SigEnergy app** under **Settings → System Settings → About → System ID**. Tap the System ID to copy it to the clipboard.
+
+With `automatic: true`, Predbat will wire all sensor and control entities automatically — no manual `apps.yaml` sensor configuration is needed.
+
+```yaml
+```
+
+### First run — onboarding approval
+
+The first time Predbat starts with the Sigenergy Cloud integration enabled, Sigenergy sends an **onboarding approval email** to the account holder.
+You must click the approval link in that email before Predbat can subscribe to live data from the MQTT broker.
+Once approved, the authorisation persists and no further action is required.
+
+### Temporarily returning control to the Sigenergy app
+
+While your system is in VPP mode, the native Sigenergy app cannot send its own schedule or mode commands.
+To temporarily hand control back, turn on the Predbat **Read-only** switch:
+
+```text
+switch.predbat_set_read_only
+```
+
+When read-only mode is enabled, Predbat switches the inverter back to **Maximise Self-Consumption** (self-use) mode, which restores full control in the Sigenergy app.
+Turn read-only mode back **off** and Predbat will automatically switch the inverter back to VPP mode on the next cycle.
+
+### Offboarding — leaving Predbat VPP entirely
+
+If you want to stop using Predbat's cloud integration altogether, flip the per-system **Offboard** toggle in Home Assistant:
+
+```text
+switch.predbat_sigenergy_<slug>_offboard
+```
+
+Turning this switch **on** calls the Sigenergy offboard API, which removes the system from VPP and exits VPP mode automatically.
+Predbat will not attempt to re-onboard or re-enter VPP mode while this switch remains on.
+
+**Note:** If you later want Predbat to resume control, turn the offboard switch back **off** — but be aware that re-onboarding will require a new approval from Sigenergy (another approval email to the account holder).
+
+## Sofar Inverters
 
 - Hardware - [sofar2mqtt EPS board](https://www.instructables.com/Sofar2mqtt-Remote-Control-for-Sofar-Solar-Inverter/) - Relatively easy to solder and flash, or can be bought pre-made.
 
@@ -2118,7 +2231,7 @@ Please see this ticket in Github for ongoing discussion: <https://github.com/spr
 
 - Predbat now has a built-in Solis cloud integration.
 
-See the components documentation for details [Components - Solis cloud](components.md#solis-cloud-api-solax)
+See the components documentation for details [Components - Solis cloud](components.md#solis-cloud-api-solis)
 
 ## Solis Inverters before FB00
 
@@ -2476,27 +2589,27 @@ Now create an automation to populate the access token:
       target:
         entity_id: input_text.tesla_access_token_part1
       data:
-        value: "{{ token_response.stdout[0:220] }}"
+        value: "{{ token_response.stdout[0:250] }}"
     - action: input_text.set_value
       target:
         entity_id: input_text.tesla_access_token_part2
       data:
-        value: "{{ token_response.stdout[220:440] }}"
+        value: "{{ token_response.stdout[250:500] }}"
     - action: input_text.set_value
       target:
         entity_id: input_text.tesla_access_token_part3
       data:
-        value: "{{ token_response.stdout[440:660] }}"
+        value: "{{ token_response.stdout[500:750] }}"
     - action: input_text.set_value
       target:
         entity_id: input_text.tesla_access_token_part4
       data:
-        value: "{{ token_response.stdout[660:880] }}"
+        value: "{{ token_response.stdout[750:1000] }}"
     - action: input_text.set_value
       target:
         entity_id: input_text.tesla_access_token_part5
       data:
-        value: "{{ token_response.stdout[880:] }}"
+        value: "{{ token_response.stdout[1000:] }}"
   mode: single
   ```
 
@@ -2880,7 +2993,7 @@ rest_command:
 
 ## Victron
 
-This is at an early stage of development, see Github discussion [#789](https://github.com/springfall2008/batpred/discussions/798) and [#2846](https://github.com/springfall2008/batpred/issues/2846)
+This is at an early stage of development, see GitHub discussion [#789](https://github.com/springfall2008/batpred/discussions/798) and [#2846](https://github.com/springfall2008/batpred/issues/2846)
 
 ## I want to add an unsupported inverter to Predbat
 

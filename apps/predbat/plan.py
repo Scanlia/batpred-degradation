@@ -24,6 +24,7 @@ from multiprocessing import Pool, cpu_count
 from const import PREDICT_STEP, TIME_FORMAT, MINUTE_WATT
 from utils import calc_percent_limit, dp0, dp1, dp2, dp3, dp4, remove_intersecting_windows, calc_percent_limit, in_car_slot
 from prediction import Prediction, wrapped_run_prediction_single, wrapped_run_prediction_charge, wrapped_run_prediction_charge_min_max, wrapped_run_prediction_export, wrapped_run_prediction_charge_min_max
+from prediction_kernel import kernel_status_summary
 from predbat_metrics import metrics
 import time
 
@@ -37,6 +38,24 @@ def slots_around(target_slots, slot_lengths):
         if slot_length <= (target_slots * 2) and slot_length >= (target_slots // 2):
             slot_choices.append(slot_length)
     return slot_choices
+
+
+MASK_64 = (1 << 64) - 1
+
+
+def scenario_hash_entry(kind, window_n, value):
+    """
+    Hash contribution of one (window, limit value) pair for incremental scenario deduplication.
+
+    Applies an avalanche mixing function (SplitMix64 finaliser) to the tuple hash: Python's tuple hash is nearly
+    linear in the last element for small values, so raw tuple hashes summed across windows
+    produce structural collisions (e.g. swapping which of two windows carries a modification).
+    The avalanche makes the summed contributions behave like independent random values.
+    """
+    acc = hash((kind, window_n, value)) & MASK_64
+    acc = ((acc ^ (acc >> 30)) * 0xBF58476D1CE4E5B9) & MASK_64
+    acc = ((acc ^ (acc >> 27)) * 0x94D049BB133111EB) & MASK_64
+    return acc ^ (acc >> 31)
 
 
 """
@@ -347,6 +366,26 @@ class Plan:
         COARSE_SLOT_LENGTHS = [32, 16, 8, 4, 2, 1, 0]
         min_freeze_percent = calc_percent_limit(self.best_soc_min, self.soc_max)
 
+        # Scenario deduplication uses an incremental hash of the absolute limit configuration: one
+        # hash contribution per (window, value) pair, summed. A candidate scenario's hash is then the
+        # reset hash plus a small delta per modified window. Unmodified windows contribute their
+        # baseline values, so the key is a pure function of the absolute configuration - equivalent to
+        # hashing the full limit lists (including across calls sharing tried_list, where the baseline
+        # changes over time) but without copying and hashing the full lists for every candidate.
+        reset_sum = 0
+        for window_n, value in enumerate(best_limits_reset):
+            reset_sum += scenario_hash_entry(0, window_n, value)
+        for window_n, value in enumerate(best_export_limits_reset):
+            reset_sum += scenario_hash_entry(1, window_n, value)
+        charge_hash_delta = {}
+        for window_n in valid_charge_windows:
+            reset_contribution = scenario_hash_entry(0, window_n, best_limits_reset[window_n])
+            charge_hash_delta[window_n] = {True: scenario_hash_entry(0, window_n, self.reserve) - reset_contribution, False: scenario_hash_entry(0, window_n, self.soc_max) - reset_contribution}
+        export_hash_delta = {}
+        for window_n in valid_export_windows:
+            reset_contribution = scenario_hash_entry(1, window_n, best_export_limits_reset[window_n])
+            export_hash_delta[window_n] = {True: scenario_hash_entry(1, window_n, 99.0) - reset_contribution, False: scenario_hash_entry(1, window_n, min_freeze_percent) - reset_contribution}
+
         # Start loop of trials
         for loop_price in all_prices:
             if best_level_score is not None:
@@ -379,16 +418,16 @@ class Plan:
                                 all_d = []
                                 count_c = 0
                                 count_d = 0
-                                try_charge_limit = best_limits_reset.copy()
-                                try_export = best_export_limits_reset.copy()
+                                charge_mods = {}  # window_n -> freeze flag, for charge windows modified from the reset limits
+                                export_mods = {}  # window_n -> freeze flag, for export windows modified from the reset limits
 
                                 for price, window_n, freeze in price_set_charge:
                                     if loop_price >= price:
                                         if freeze and not try_charge_freeze:
                                             pass
-                                        elif count_c < max_charge_slots and (window_n not in all_n):
+                                        elif count_c < max_charge_slots and (window_n not in charge_mods):
                                             all_n.append(window_n)
-                                            try_charge_limit[window_n] = self.reserve if freeze else self.soc_max
+                                            charge_mods[window_n] = freeze
                                             count_c += 1
 
                                 for price, window_n, freeze in price_set_export:
@@ -396,28 +435,38 @@ class Plan:
                                         # For prices above threshold try export
                                         if freeze and not try_export_freeze:
                                             pass
-                                        elif count_d < max_export_slots and (window_n not in all_d):
+                                        elif count_d < max_export_slots and (window_n not in export_mods):
                                             if not self.car_charging_from_battery and self.hit_car_window(export_window[window_n]["start"], export_window[window_n]["end"]):
                                                 pass
                                             elif not self.iboost_on_export and self.iboost_enable and self.iboost_plan and (self.hit_charge_window(self.iboost_plan, export_window[window_n]["start"], export_window[window_n]["end"]) >= 0):
                                                 pass
                                             else:
                                                 all_d.append(window_n)
-                                                try_export[window_n] = 99.0 if freeze else min_freeze_percent
+                                                export_mods[window_n] = freeze
                                                 count_d += 1
 
                                 # Remove export hitting charge windows if this is disabled
                                 if not self.calculate_export_oncharge:
                                     for window_n in all_d[:]:
                                         hit_charge = self.hit_charge_window(self.charge_window_best, export_window[window_n]["start"], export_window[window_n]["end"])
-                                        if hit_charge >= 0 and try_charge_limit[hit_charge] > 0.0:
-                                            # Only remove if it doesn't remove the charge window entirely
-                                            if not (export_window[window_n]["start"] <= self.charge_window_best[hit_charge]["start"] and export_window[window_n]["end"] >= self.charge_window_best[hit_charge]["end"]):
-                                                try_export[window_n] = 100.0
-                                                all_d.remove(window_n)
+                                        if hit_charge >= 0:
+                                            if hit_charge in charge_mods:
+                                                hit_charge_limit = self.reserve if charge_mods[hit_charge] else self.soc_max
+                                            else:
+                                                hit_charge_limit = best_limits_reset[hit_charge]
+                                            if hit_charge_limit > 0.0:
+                                                # Only remove if it doesn't remove the charge window entirely
+                                                if not (export_window[window_n]["start"] <= self.charge_window_best[hit_charge]["start"] and export_window[window_n]["end"] >= self.charge_window_best[hit_charge]["end"]):
+                                                    # Dropping the modification restores the reset value (100.0) for this window
+                                                    export_mods.pop(window_n, None)
+                                                    all_d.remove(window_n)
 
                                 # Skip this one as it's the same as selected already
-                                try_hash = hash((tuple(try_charge_limit), tuple(try_export)))
+                                try_hash = reset_sum
+                                for window_n, freeze in charge_mods.items():
+                                    try_hash += charge_hash_delta[window_n][freeze]
+                                for window_n, freeze in export_mods.items():
+                                    try_hash += export_hash_delta[window_n][freeze]
                                 if try_hash in tried_list:
                                     try_value = tried_list[try_hash]
                                     if try_value is not True:
@@ -427,6 +476,14 @@ class Plan:
                                     continue
 
                                 tried_list[try_hash] = True
+
+                                # Materialise the full limit lists only for scenarios that will run predictions
+                                try_charge_limit = best_limits_reset.copy()
+                                for window_n, freeze in charge_mods.items():
+                                    try_charge_limit[window_n] = self.reserve if freeze else self.soc_max
+                                try_export = best_export_limits_reset.copy()
+                                for window_n, freeze in export_mods.items():
+                                    try_export[window_n] = 99.0 if freeze else min_freeze_percent
 
                                 pred_item = {}
                                 pred_item["handle"] = self.launch_run_prediction_single(try_charge_limit, charge_window, export_window, try_export, False, end_record=end_record, step=step)
@@ -1028,6 +1085,8 @@ class Plan:
         # factor each cycle so the flat plan is evaluated raw (norm computed from it).
         self.degradation_norm_factor = None
         self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+        kernel_message, kernel_is_warning = kernel_status_summary(self.prediction)
+        self.log("{}Prediction kernel: {}".format("Warn: " if kernel_is_warning else "", kernel_message))
 
         # Check if LoadML is active and disable thread pools as it causes lockup due to race conditions with NumPy
         load_ml_comp = self.components.get_component("load_ml") if self.components else None
@@ -1927,11 +1986,17 @@ class Plan:
                 metric -= 0.001
 
             # Adjust to try to keep existing windows
+            keep_export = False
             if window_n < 2 and this_export_limit < 99.0 and self.export_window and self.isExporting:
                 pwindow = export_window[window_n]
                 dwindow = self.export_window[0]
                 if self.minutes_now >= pwindow["start"] and self.minutes_now < pwindow["end"] and ((self.minutes_now >= dwindow["start"] and self.minutes_now < dwindow["end"]) or (dwindow["end"] == pwindow["start"])):
                     metric -= max(0.5, self.metric_min_improvement_export)
+                    # Only relax the cost gate (further below) for an option that actually covers the current
+                    # minute. The option start is varied during optimisation, so a future-starting option is
+                    # not the in-progress export and must not receive the cost-gate commitment.
+                    if start <= self.minutes_now:
+                        keep_export = True
 
             # Round metric to 4 DP
             metric = dp4(metric)
@@ -1976,6 +2041,14 @@ class Plan:
                 min_improvement_scaled = self.metric_min_improvement_export * rate_scale * len(all_n)
             else:
                 min_improvement_scaled = self.metric_min_improvement_export * window_size * rate_scale / float(self.plan_interval_minutes)
+
+            # When already exporting within this window keep the export going across planning cycles by
+            # relaxing the cost gate (not just the metric above). This only sustains an in-progress forced
+            # export (it never opens a new one) so it cannot reintroduce the metric_keep gaming of issue #2984.
+            # It prevents export oscillation on near-flat multi-slot price peaks where exporting now versus
+            # holding and exporting the adjacent equal-priced slot is otherwise a cost coin-toss each cycle.
+            if keep_export:
+                min_improvement_scaled = min(min_improvement_scaled, -max(0.5, self.metric_min_improvement_export))
 
             # Only select an export if it makes a notable improvement has defined by min_improvement (divided in M windows)
             # Also require cost improvement to prevent exports that only game metric_keep without actual savings (issue #2984)
@@ -2618,6 +2691,156 @@ class Plan:
             self.charge_window_best = orig_charge_window_best
             self.charge_limit_best = orig_charge_limit_best
             return html_data, json_data
+
+    def optimise_solar(self, best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import, record_export_windows, debug_mode=False):
+        """
+        Export more solar optimisation.
+
+        Enables freeze export (export limit 99) on every currently idle export window that has
+        predicted PV generation, then simulates the resulting plan. The new plan is only kept if it
+        does not increase the overall metric by more than export_more_solar_threshold, otherwise the
+        original export limits are restored. This is an optimiser only pass - execution is unchanged
+        as the resulting freeze export slots are handled by the normal freeze export logic.
+
+        Returns the (possibly updated) metric tuple so the caller stays consistent with the plan.
+        """
+        curr = self.currency_symbols[1]
+
+        # Freeze export slots only have an effect when export freeze is enabled
+        if not self.calculate_best_export or not self.set_export_freeze or not self.export_window_best:
+            return best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import
+
+        pv_forecast_minute_step = self.prediction.pv_forecast_minute_step
+
+        # Work out which calendar days are covered by the record export windows. Each day is
+        # considered independently as exporting more solar may be worthwhile on one day but not another.
+        days = []
+        for window_n in range(record_export_windows):
+            window_start = self.export_window_best[window_n]["start"]
+            if window_start >= (self.minutes_now + self.end_record):
+                continue
+            day = window_start // (24 * 60)
+            if day not in days:
+                days.append(day)
+        days.sort()
+
+        for day in days:
+            # Snapshot the current plan so we can revert this day if it costs too much. The window
+            # list is snapshotted too as re-optimising force exports can move window start times.
+            orig_export_limits_best = copy.deepcopy(self.export_limits_best)
+            orig_export_window_best = copy.deepcopy(self.export_window_best)
+
+            day_start = day * (24 * 60)
+            day_end = day_start + (24 * 60)
+
+            # Find the first minute of solar generation on this day (cannot act in the past)
+            first_solar_minute = None
+            for minute_absolute in range(max(day_start, self.minutes_now), day_end, PREDICT_STEP):
+                if pv_forecast_minute_step.get(minute_absolute - self.minutes_now, 0) > 0:
+                    first_solar_minute = minute_absolute
+                    break
+
+            # No solar on this day means there is nothing extra to export
+            if first_solar_minute is None:
+                continue
+
+            added = 0
+            for window_n in range(record_export_windows):
+                window_start = self.export_window_best[window_n]["start"]
+                window_end = self.export_window_best[window_n]["end"]
+
+                # Only consider idle windows on this calendar day within the record period
+                if window_start // (24 * 60) != day:
+                    continue
+                if window_start >= (self.minutes_now + self.end_record):
+                    continue
+                if window_start in self.manual_all_times:
+                    continue
+
+                # An existing freeze export slot may have been trimmed earlier (start moved later) -
+                # restore it to its original full size so it covers the whole solar period
+                if self.export_limits_best[window_n] == 99.0:
+                    start_orig = self.export_window_best[window_n].get("start_orig", window_start)
+                    if start_orig < window_start:
+                        self.export_window_best[window_n]["start"] = start_orig
+                    continue
+
+                # Only enable currently idle (disabled) export windows
+                if self.export_limits_best[window_n] != 100.0:
+                    continue
+
+                # Don't freeze export where a charge is already planned - we can't charge the battery
+                # and freeze export (which disables charging) at the same time
+                hit_charge = self.hit_charge_window(self.charge_window_best, window_start, window_end)
+                if hit_charge >= 0 and self.charge_limit_best[hit_charge] != 0:
+                    continue
+
+                # Don't freeze export over a car charging slot - freeze export disables charging so the
+                # battery can't be topped up for the car, unless the car is allowed to charge from the battery
+                if not self.car_charging_from_battery and self.hit_car_window(window_start, window_end):
+                    continue
+
+                # Only enable windows where we expect to generate any solar to export
+                pv_period = 0
+                for minute in range(window_start - self.minutes_now, window_end - self.minutes_now, PREDICT_STEP):
+                    pv_period += pv_forecast_minute_step.get(minute, 0)
+                if pv_period < 0.01:
+                    continue
+
+                self.export_limits_best[window_n] = 99.0
+                added += 1
+
+            if not added:
+                continue
+
+            # Now we are exporting more solar, re-optimise any force export slots later in the day as
+            # they may need their export level reducing given the battery now holds less stored solar.
+            re_optimised = 0
+            for window_n in range(record_export_windows):
+                window_start = self.export_window_best[window_n]["start"]
+
+                # Only force export slots (limit below the freeze sentinel) on this day, after first solar
+                if window_start // (24 * 60) != day:
+                    continue
+                if window_start >= (self.minutes_now + self.end_record):
+                    continue
+                if window_start in self.manual_all_times:
+                    continue
+                if self.export_limits_best[window_n] >= 99.0:
+                    continue
+                if window_start <= first_solar_minute:
+                    continue
+                if not self.allow_this_export_window(window_n):
+                    continue
+
+                new_soc, new_start, new_metric, new_cost, new_soc_min, new_soc_min_minute, new_keep, new_cycle, new_carbon, new_import = self.optimise_export(
+                    window_n, record_export_windows, self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, end_record=self.end_record
+                )
+                self.export_limits_best[window_n] = new_soc
+                self.export_window_best[window_n]["start_orig"] = self.export_window_best[window_n].get("start_orig", self.export_window_best[window_n]["start"])
+                self.export_window_best[window_n]["start"] = new_start
+                re_optimised += 1
+
+            # Simulate the final plan for this day on top of any days already kept and decide on the
+            # final metric after the force exports have been re-optimised.
+            new_metric, new_battery_value, new_cost, new_keep, new_cycle, new_carbon, new_import, new_export = self.run_prediction_metric(
+                self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, end_record=self.end_record
+            )
+            self.plan_write_debug(debug_mode, "plan_more_solar_{}.html".format(day), self.pv_forecast_minute_step, self.pv_forecast_minute10_step, self.load_minutes_step, self.load_minutes_step10, self.end_record)
+
+            if (new_metric - best_metric) <= self.export_more_solar_threshold:
+                self.log(
+                    "Export more solar day {} enabled freeze export on {} idle solar window(s), re-optimised {} force export(s), metric {}{} (was {}{}, threshold {}{}) - keeping".format(
+                        day, added, re_optimised, dp2(new_metric), curr, dp2(best_metric), curr, self.export_more_solar_threshold, curr
+                    )
+                )
+                best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import = new_metric, new_cost, new_keep, new_cycle, new_carbon, new_import
+            else:
+                self.log("Export more solar day {} rejected - metric {}{} exceeds {}{} by more than threshold {}{}, reverting".format(day, dp2(new_metric), curr, dp2(best_metric), curr, self.export_more_solar_threshold, curr))
+                self.export_limits_best = orig_export_limits_best
+                self.export_window_best = orig_export_window_best
+
+        return best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import
 
     def optimise_swap_export(self, record_charge_windows, record_export_windows, drop=False, debug_mode=False):
         """
@@ -3453,6 +3676,10 @@ class Plan:
             # Tweak plan (faster)
             best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import = self.tweak_plan(self.end_record, best_metric, best_keep)
 
+        # Export more solar - enable freeze export on idle solar windows if it doesn't cost too much
+        if self.export_more_solar:
+            best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import = self.optimise_solar(best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import, record_export_windows, debug_mode=debug_mode)
+
         self.plan_write_debug(debug_mode, "plan_raw.html", self.pv_forecast_minute_step, self.pv_forecast_minute10_step, self.load_minutes_step, self.load_minutes_step10, self.end_record)
 
         # Return
@@ -3605,22 +3832,23 @@ class Plan:
                         round(final_pv_kwh, 2),
                     )
                 )
-                self.log("   Slot: [{}]".format(self.scenario_summary_title(record_time)))
-                self.log("    SoC: [{}] kWh".format(self.scenario_summary(record_time, predict_soc_time)))
-                self.log("    BAT: [{}] kWh".format(self.scenario_summary(record_time, predict_state)))
-                self.log("   LOAD: [{}] kWh".format(self.scenario_summary(record_time, load_kwh_time)))
-                self.log("     PV: [{}] kWh".format(self.scenario_summary(record_time, pv_kwh_time)))
-                self.log(" IMPORT: [{}] kWh".format(self.scenario_summary(record_time, import_kwh_time)))
-                self.log(" EXPORT: [{}] kWh".format(self.scenario_summary(record_time, export_kwh_time)))
-                if self.iboost_enable:
-                    self.log(" IBOOST: [{}] kWh".format(self.scenario_summary(record_time, predict_iboost)))
-                if self.carbon_enable:
-                    self.log(" CARBON: [{}] kg".format(self.scenario_summary(record_time, predict_carbon_g)))
-                for car_n in range(self.num_cars):
-                    self.log("   CAR{}: [{}] kWh".format(car_n, self.scenario_summary(record_time, predict_car_soc_time[car_n])))
-                self.log(" METRIC: [{}] {}".format(self.scenario_summary(record_time, metric_time), self.currency_symbols[1]))
-                if save == "best":
-                    self.log(" STATE:  [{}]".format(self.scenario_summary_state(record_time)))
+                if self.debug_enable:
+                    self.log("   Slot: [{}]".format(self.scenario_summary_title(record_time)))
+                    self.log("    SoC: [{}] kWh".format(self.scenario_summary(record_time, predict_soc_time)))
+                    self.log("    BAT: [{}] kWh".format(self.scenario_summary(record_time, predict_state)))
+                    self.log("   LOAD: [{}] kWh".format(self.scenario_summary(record_time, load_kwh_time)))
+                    self.log("     PV: [{}] kWh".format(self.scenario_summary(record_time, pv_kwh_time)))
+                    self.log(" IMPORT: [{}] kWh".format(self.scenario_summary(record_time, import_kwh_time)))
+                    self.log(" EXPORT: [{}] kWh".format(self.scenario_summary(record_time, export_kwh_time)))
+                    if self.iboost_enable:
+                        self.log(" IBOOST: [{}] kWh".format(self.scenario_summary(record_time, predict_iboost)))
+                    if self.carbon_enable:
+                        self.log(" CARBON: [{}] kg".format(self.scenario_summary(record_time, predict_carbon_g)))
+                    for car_n in range(self.num_cars):
+                        self.log("   CAR{}: [{}] kWh".format(car_n, self.scenario_summary(record_time, predict_car_soc_time[car_n])))
+                    self.log(" METRIC: [{}] {}".format(self.scenario_summary(record_time, metric_time), self.currency_symbols[1]))
+                    if save == "best":
+                        self.log(" STATE:  [{}]".format(self.scenario_summary_state(record_time)))
 
             # Save data to HA state
             if save and save == "base":
