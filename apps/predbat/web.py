@@ -2967,7 +2967,7 @@ chart.render();
             text += self.render_chart(series_data, "kW", "Solar Forecast", now_str)
         elif chart == "PVAccuracy":
             # Get pv_today history once and extract total and remaining attributes per timestamp
-            pv_today_hist = self.get_history_wrapper("sensor." + self.prefix + "_pv_today", 7, required=False)
+            pv_today_hist = self.get_history_wrapper("sensor." + self.prefix + "_pv_today", 14, required=False)
             pv_total_raw = history_attribute(pv_today_hist, attributes=True, state_key="totalCL")
             pv_remaining_raw = history_attribute(pv_today_hist, attributes=True, state_key="remainingCL")
             # Compute forecast so far = total - remaining per timestamp
@@ -2977,7 +2977,7 @@ chart.render();
                 pv_forecast_sofar_raw[ts] = dp2(max(total_val - remaining_val, 0))
             pv_forecast_sofar = prune_today(pv_forecast_sofar_raw, self.now_utc, self.midnight_utc, prune=False)
             # Get actual PV energy over time
-            pv_actual_hist = history_attribute(self.get_history_wrapper(self.prefix + ".pv_energy_h0", 7, required=False))
+            pv_actual_hist = history_attribute(self.get_history_wrapper(self.prefix + ".pv_energy_h0", 14, required=False))
             pv_actual = prune_today(pv_actual_hist, self.now_utc, self.midnight_utc, prune=False)
             series_data = [
                 {"name": "PV Forecast (so far)", "data": pv_forecast_sofar, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "stepline", "color": "#a8a8a7"},
