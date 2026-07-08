@@ -8,6 +8,7 @@ AIO's
 aiofiles
 aiohttp
 aiomqtt
+aios
 Alertfeed
 allclose
 Anson
@@ -15,8 +16,11 @@ apexcharts
 apikey
 appdaemon
 appkey
+Apprent
 appsyaml
 argname
+armhf
+armv
 ASHP
 asyncio
 autodocstring
@@ -26,10 +30,12 @@ autopep
 autoupdate
 axvline
 axvspan
+Backfeed
 backprop
 Backpropagate
 backpropagation
 backsteps
+backtest
 Basepath
 Batpred
 battemperature
@@ -39,6 +45,7 @@ beforeunload
 bierner
 brickatius
 byok
+cadata
 calib
 Cantarell
 cexxxx
@@ -54,6 +61,7 @@ Codespaces
 collapsable
 compareform
 configform
+connack
 Consolas
 coro
 cprofile
@@ -96,6 +104,7 @@ dstart
 dwindow
 Eddi
 elif
+emqx
 emszzzz
 enctype
 endfor
@@ -109,6 +118,8 @@ energydataservice
 energythroughput
 epod
 euids
+EVDC
+evergen
 evse
 exog
 exportlimit
@@ -117,6 +128,7 @@ fdsoc
 feedin
 fentry
 figsize
+finaliser
 Fingerbot
 firstparty
 fline
@@ -125,6 +137,7 @@ fontsize
 fontweight
 Forestfire
 foxess
+foxesscloud
 freephase
 fronius
 funcs
@@ -139,6 +152,8 @@ getall
 Ginlong
 GivEnergy
 givtcp
+gnueabihf
+gridcode
 gridconsumption
 gridconsumptionpower
 growatt
@@ -157,6 +172,7 @@ heatingactive
 heatingtemp
 heatpump
 heatsink
+holdout
 homeassistant
 houseb
 htmlcov
@@ -167,6 +183,7 @@ idag
 idetails
 idxs
 iflux
+importlimit
 inday
 INTELLI
 intelligentdevice
@@ -194,6 +211,7 @@ kwhb
 labelcolor
 labelnames
 larr
+libc
 linebreak
 linestyle
 loadml
@@ -228,6 +246,7 @@ minsocongrid
 minuteb
 Mixergy
 mkdocs
+mlugg
 Modbus
 mogons
 monokai
@@ -252,6 +271,7 @@ nordpool
 nosc
 nrgheat
 numpy
+OCPP
 octo
 octoplus
 octopoints
@@ -265,32 +285,36 @@ onmouseout
 onmouseover
 openweathermap
 overfitting
+overvoltage
 ownerapi
+pbat
 pbgw
 pdata
 pdetails
 perc
 percnt
-PeterHaban
+peterhaban
 photovoltaics
 pitem
 pkwh
-Plenticore
+plenticore
 postdata
 powercontrolmode
 powerline
 Powerwall
 ppdetails
 ppkwh
-Pred
-Predai
-Predbat
+pred
+predai
+predbat
 predbatt
-Predheat
+predheat
+prevs
 psum
 pvbat
 pvenergytotal
 pvlib
+pvlimit
 pvpower
 pvwatts
 pwindow
@@ -301,6 +325,7 @@ pytest
 pytz
 randn
 rarr
+reactivepower
 recp
 Redownload
 regionid
@@ -330,7 +355,9 @@ Selfuse
 semodbus
 Sergoe
 SFMB
+sigcloud
 sigen
+sigencloud
 sigenergy
 sigenstor
 Slee
@@ -361,6 +388,7 @@ stepline
 Stromligning
 strptime
 Strømligning
+submessage
 substep
 sunspec
 sunsynk
@@ -396,6 +424,7 @@ treforsiphone
 twinx
 tzfile
 tzpath
+unconfigured
 unsmoothed
 unstaged
 useid
@@ -407,6 +436,7 @@ visibilitychange
 Wallbox
 weblink
 welink
+Werror
 workmode
 writeonly
 wrongsha
@@ -415,6 +445,7 @@ xaxistooltip
 xlabel
 xlim
 xload
+xrtkq
 xticks
 yaxis
 yaxistooltip
@@ -422,3 +453,4 @@ yday
 ylabel
 yuanzhi
 zappi
+zigbee

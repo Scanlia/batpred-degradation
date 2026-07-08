@@ -24,7 +24,7 @@ import pytz
 import requests
 from datetime import datetime, timedelta
 from config import INVERTER_DEF, SOLAX_SOLIS_MODES_NEW, SOLAX_SOLIS_MODES
-from const import MINUTE_WATT, TIME_FORMAT, TIME_FORMAT_OCTOPUS, INVERTER_TEST, TIME_FORMAT_SECONDS, INVERTER_MAX_RETRY, INVERTER_MAX_RETRY_REST
+from const import MINUTE_WATT, TIME_FORMAT, TIME_FORMAT_OCTOPUS, INVERTER_TEST, TIME_FORMAT_SECONDS, INVERTER_MAX_RETRY, INVERTER_MAX_RETRY_REST, INVERTER_REST_TIMEOUT
 from utils import calc_percent_limit, compute_window_minutes, dp0, dp1, dp2, dp3, dp4, time_string_to_stamp, minute_data, minute_data_state, window2minutes
 
 TIME_FORMAT_HMS = "%H:%M:%S"
@@ -569,6 +569,13 @@ class Inverter:
             self.nominal_capacity = self.base.get_arg("soc_max_nominal", index=self.id, default=0.0)
         self.base.set_arg("soc_max_nominal", self.nominal_capacity, index=self.id)
 
+        # If the live soc_max read was invalid (e.g. the source sensor was momentarily unavailable)
+        # but we recovered a valid nominal from soc_max_nominal, recompute soc_max so the known-good
+        # capacity takes effect instead of falling through to the 8 kWh default below.
+        if (not self.soc_max or self.soc_max <= 0) and self.nominal_capacity and self.nominal_capacity > 0:
+            self.soc_max = dp3(self.nominal_capacity * self.battery_scaling)
+            self.log("Note: inverter {} soc_max source unavailable this cycle, retained last known battery size {:.3f} kWh".format(self.id, self.soc_max))
+
         if not self.nominal_capacity or self.nominal_capacity <= 0:
             self.log("Note: Battery size was not set for inverter {}, enabling battery_scaling_auto".format(self.id))
             self.base.battery_scaling_auto = True
@@ -616,11 +623,13 @@ class Inverter:
 
         # Final fallback if soc_max is still not determined
         if not self.soc_max or self.soc_max <= 0:
-            self.log("Warn: Unable to determine battery size for inverter {}, setting to 8 kWh default, you must set soc_max in apps.yaml or wait until enough data is collected to estimate battery size".format(self.id))
+            self.log("Warn: Unable to determine battery size for inverter {}, using 8 kWh default for this cycle, you must set soc_max in apps.yaml or wait until enough data is collected to estimate battery size".format(self.id))
             self.soc_max = 8.0
-            self.base.set_arg("soc_max", self.soc_max, index=self.id)
-            self.base.set_arg("soc_max_nominal", 0.0, index=self.id)
             self.nominal_capacity = self.soc_max
+            # Intentionally do NOT persist the fallback into the soc_max / soc_max_nominal args:
+            # caching 8.0 would override a configured (but momentarily unavailable) source and pin
+            # soc_max to 8 kWh until restart. Leaving the args intact lets the next cycle re-read the
+            # real source (or restore soc_max_nominal) and recover automatically.
 
     def update_soc_max_calculated_sensor(self, found_size, nominal_capacity=0):
         """
@@ -724,6 +733,7 @@ class Inverter:
                         divide_by=1.0,
                         scale=1.0,
                         required_unit="%",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                     )
                 else:
                     soc_percent = {}
@@ -744,6 +754,7 @@ class Inverter:
                         divide_by=1.0,
                         scale=1.0,
                         required_unit="kWh",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                     )
                     # Determine soc_max from nominal_capacity or the observed maximum
                     if nominal_capacity and nominal_capacity > 0:
@@ -770,6 +781,7 @@ class Inverter:
                 divide_by=1.0,
                 scale=1.0,
                 required_unit="W",
+                can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
             )
             if battery_power_invert:
                 # Invert the battery power if required
@@ -779,10 +791,22 @@ class Inverter:
             self.log("Find battery size has {} days of data, max days {}".format(dp0(min_len / 60 / 24.0), self.base.max_days_previous))
 
             estimate_battery_sizes = []
+            rejected_battery_sizes = {}
 
             # Find continuous charging periods and calculate battery size from energy/SoC relationship
             # Data is indexed backwards: minute 0 = now, minute N = N minutes ago
-            max_power_threshold = 50
+            max_charge_power_w = max(self.battery_rate_max_charge * MINUTE_WATT, 0)
+            max_power_threshold = max(250, max_charge_power_w * 0.2)
+            loss_factor = self.base.battery_loss * self.base.inverter_loss
+            size_hint = self.soc_max if self.soc_max and self.soc_max > 0 else 0
+            capacity_reference = nominal_capacity if nominal_capacity and nominal_capacity > 0 else 0
+            plausible_min = capacity_reference * 0.65 if capacity_reference else 0
+            plausible_max = capacity_reference * 1.20 if capacity_reference else 0
+            reference_for_energy = capacity_reference or size_hint
+            min_power_added_kwh = max(0.5, min(1.0, reference_for_energy * 0.04)) if reference_for_energy else 0.5
+
+            def reject_battery_sample(reason):
+                rejected_battery_sizes[reason] = rejected_battery_sizes.get(reason, 0) + 1
 
             # Scan backwards through time to find charging periods
             in_charge = False
@@ -875,32 +899,98 @@ class Inverter:
                             )
                         )
 
-                        if percent_change > 5:  # Need at least 5% change for a meaningful estimate
-                            # Calculate energy added during this period (using clipped range)
-                            power_added = 0.0
-                            sample_count = 0
-                            for power_minute in range(clipped_start_minute, clipped_end_minute - 1, -1):
-                                minute_power = -battery_power.get(power_minute, 0)
-                                power_added += minute_power / 60.0  # W to Wh
-                                sample_count += 1
+                        if percent_change < 10:
+                            reject_battery_sample("soc_change_too_small")
+                            continue
 
-                            self.log("  Power added over {} samples is {}kWh".format(sample_count, dp1(power_added / 1000)))
+                        if percent_change > 80:
+                            reject_battery_sample("soc_change_too_large")
+                            continue
 
-                            if power_added > 0:
-                                estimated_battery_size = (power_added / percent_change) * 100.0 / 1000.0  # Convert Wh to kWh
-                                estimated_battery_size = dp2(estimated_battery_size)
-                                estimate_battery_sizes.append(estimated_battery_size)
+                        # Need enough real charge data to avoid SoC telemetry jumps being mistaken for capacity.
+                        if clipped_start_minute - clipped_end_minute < 20:
+                            reject_battery_sample("charge_period_too_short")
+                            continue
+
+                        if percent_change >= clipped_start_minute - clipped_end_minute:
+                            reject_battery_sample("soc_jump_too_fast")
+                            continue
+
+                        # Calculate energy added during this period (using clipped range)
+                        power_added = 0.0
+                        sample_count = 0
+                        for power_minute in range(clipped_start_minute, clipped_end_minute - 1, -1):
+                            minute_power = -battery_power.get(power_minute, 0)
+                            power_added += minute_power / 60.0  # W to Wh
+                            sample_count += 1
+
+                        power_added_kwh = power_added / 1000.0
+                        self.log("  Power added over {} samples is {}kWh".format(sample_count, dp1(power_added_kwh)))
+
+                        if power_added_kwh < min_power_added_kwh:
+                            reject_battery_sample("energy_too_small")
+                            continue
+
+                        estimated_battery_size = (power_added / percent_change) * 100.0 / 1000.0  # Convert Wh to kWh
+                        adjusted_battery_size = estimated_battery_size * loss_factor
+
+                        if plausible_min and adjusted_battery_size < plausible_min:
+                            reject_battery_sample("capacity_too_low")
+                            continue
+
+                        if plausible_max and adjusted_battery_size > plausible_max:
+                            reject_battery_sample("capacity_too_high")
+                            continue
+
+                        estimate_battery_sizes.append(
+                            {
+                                "size": estimated_battery_size,
+                                "adjusted_size": adjusted_battery_size,
+                                "soc_change": percent_change,
+                                "sample_count": sample_count,
+                                "power_added_kwh": power_added_kwh,
+                            }
+                        )
+
+                        self.log(
+                            "  Battery size sample accepted raw {}kWh adjusted {}kWh from {}% SoC over {} minutes".format(
+                                dp2(estimated_battery_size),
+                                dp2(adjusted_battery_size),
+                                percent_change,
+                                sample_count,
+                            )
+                        )
 
             # Average the estimated battery sizes
             if len(estimate_battery_sizes) > 0:
-                average_battery_size = sum(estimate_battery_sizes) / len(estimate_battery_sizes)
-                average_battery_size = dp2(average_battery_size)
-                # Add in charging loss factor, assume the inverter loss is not counted in the charge rate sensor (as it's AC side)
-                average_battery_size *= self.base.battery_loss * self.base.inverter_loss
-                self.log("Estimated battery size is {}kWh from {} samples (assumed charging loss factor {})".format(dp2(average_battery_size), len(estimate_battery_sizes), dp1(self.base.battery_loss * self.base.inverter_loss)))
+                strong_battery_sizes = [sample for sample in estimate_battery_sizes if sample["soc_change"] >= 20 and sample["sample_count"] >= 60 and sample["power_added_kwh"] >= max(min_power_added_kwh * 4, 4.0)]
+                selected_battery_sizes = strong_battery_sizes if len(strong_battery_sizes) >= 3 else estimate_battery_sizes
+                selected_values = sorted([sample["adjusted_size"] for sample in selected_battery_sizes])
+
+                if len(selected_values) >= 5:
+                    trim_count = max(1, int(len(selected_values) * 0.1))
+                    trimmed_values = selected_values[trim_count:-trim_count]
+                elif len(selected_values) >= 3:
+                    trimmed_values = selected_values[1:-1]
+                else:
+                    trimmed_values = selected_values
+
+                average_battery_size = dp2(sum(trimmed_values) / len(trimmed_values))
+                median_battery_size = selected_values[len(selected_values) // 2] if len(selected_values) % 2 else (selected_values[len(selected_values) // 2 - 1] + selected_values[len(selected_values) // 2]) / 2
+                self.log(
+                    "Estimated battery size is {}kWh from {} selected samples, {} accepted samples, {} rejected samples, median {}kWh (assumed charging loss factor {}, rejects {})".format(
+                        dp2(average_battery_size),
+                        len(selected_battery_sizes),
+                        len(estimate_battery_sizes),
+                        sum(rejected_battery_sizes.values()),
+                        dp2(median_battery_size),
+                        dp1(loss_factor),
+                        rejected_battery_sizes,
+                    )
+                )
                 return average_battery_size
             else:
-                self.log("Warn: Unable to find any suitable charge periods to estimate battery size")
+                self.log("Warn: Unable to find any suitable charge periods to estimate battery size, rejected samples {}".format(rejected_battery_sizes))
                 return None
         else:
             self.log("Warn: Unable to estimate battery size from soc_percent and battery_power data")
@@ -975,6 +1065,7 @@ class Inverter:
                         divide_by=1.0,
                         scale=self.battery_scaling,
                         required_unit="%",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                     )
                     for entry in soc_kwh:
                         soc_kwh[entry] = dp4(soc_kwh[entry] * self.soc_max / 100.0)
@@ -991,6 +1082,7 @@ class Inverter:
                         divide_by=1.0,
                         scale=self.battery_scaling,
                         required_unit="kWh",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                     )
                 charge_rate, ignore_io = minute_data(
                     charge_rate_data[0],
@@ -1004,6 +1096,7 @@ class Inverter:
                     divide_by=1.0,
                     scale=1.0,
                     required_unit="W",
+                    can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                 )
                 predbat_status = minute_data_state(predbat_status_data[0], self.base.max_days_previous, self.base.now_utc, "state", "last_updated")
                 for minute in predbat_status:
@@ -1023,6 +1116,7 @@ class Inverter:
                     divide_by=1.0,
                     scale=1.0,
                     required_unit="W",
+                    can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                 )
                 if battery_power_invert:
                     # Invert the battery power if required
@@ -1197,8 +1291,8 @@ class Inverter:
                         self.log("Warn: Found incomplete battery {} curve (no data points), maybe try again when you have more data.".format(curve_type))
                 else:
                     self.log(
-                        "Warn: Cannot find battery {} curve (no full rate {} curve found for battery to {}), one of the required settings for {}, {}_rate, battery_power and predbat.status do not have history, check apps.yaml".format(
-                            curve_type, curve_type, curve_label, soc_label, curve_type
+                        "Info: Cannot find battery {} curve (no full rate {} cycle to {} found in history), battery may not have been fully charged/discharged at max rate recently - this is normal in cost-optimised operation".format(
+                            curve_type, curve_type, curve_label
                         )
                     )
             else:
@@ -1808,14 +1902,16 @@ class Inverter:
             self.base.log("Inverter {} Current charge limit is {}% and new target is {}%".format(self.id, current_soc, soc))
             self.current_charge_limit = soc
             if self.rest_data:
+                # Enable charge target, without it the inverter ignores the target SOC.
+                # rest_enableChargeTarget no-ops if already enabled.
+                self.rest_enableChargeTarget(True)
                 self.rest_setChargeTarget(soc)
             else:
                 self.write_and_poll_value("charge_limit", self.base.get_arg("charge_limit", indirect=False, index=self.id, required_unit="%"), soc)
-
-            charge_limit_enable_entity_id = self.base.get_arg("charge_limit_enable", indirect=False, index=self.id)
-            if charge_limit_enable_entity_id:
-                # If we have a separate enable for the charge limit then make sure it's enabled when we set the charge limit
-                self.write_and_poll_switch("charge_limit_enable", charge_limit_enable_entity_id, True)
+                charge_limit_enable_entity_id = self.base.get_arg("charge_limit_enable", indirect=False, index=self.id)
+                if charge_limit_enable_entity_id:
+                    # If we have a separate enable for the charge limit then make sure it's enabled when we set the charge limit
+                    self.write_and_poll_switch("charge_limit_enable", charge_limit_enable_entity_id, True)
 
             # For inverters that need a button press to apply changes (e.g., Fox), press the button now
             if self.inv_time_button_press:
@@ -1951,7 +2047,7 @@ class Inverter:
             return False
         entity_base = entity_id.split(".")[0]
 
-        if entity_base not in ["input_select", "select", "time"]:
+        if entity_base not in ["input_select", "select", "time", "input_datetime"]:
             return self.write_and_poll_value(name, entity_id, new_value, ignore_fail=ignore_fail)
 
         old_value = self.base.get_state_wrapper(entity_id, refresh=True)
@@ -1968,6 +2064,9 @@ class Inverter:
             if entity_base == "time":
                 service = entity_base + "/set_value"
                 self.base.call_service_wrapper(service, time=new_value, entity_id=entity_id)
+            elif entity_base == "input_datetime":
+                # input_datetime uses set_datetime (not set_value) with a time= parameter for time-only entities
+                self.base.call_service_wrapper("input_datetime/set_datetime", time=new_value, entity_id=entity_id)
             else:
                 service = entity_base + "/select_option"
                 self.base.call_service_wrapper(service, option=new_value, entity_id=entity_id)
@@ -2994,7 +3093,12 @@ class Inverter:
         """
         Send REST Command
         """
-        r = requests.post(url, json=json)
+        try:
+            r = requests.post(url, json=json, timeout=INVERTER_REST_TIMEOUT)
+        except Exception as e:
+            self.base.log("Warn: Inverter {} REST POST {} failed: {}".format(self.id, url, e))
+            return None
+        return r
 
     def rest_getData(self, url):
         """
@@ -3003,7 +3107,7 @@ class Inverter:
         r = None
 
         try:
-            r = requests.get(url)
+            r = requests.get(url, timeout=INVERTER_REST_TIMEOUT)
         except Exception as e:
             self.base.log("Error: Exception raised {}".format(e))
 
@@ -3011,6 +3115,37 @@ class Inverter:
             return r.json()
         else:
             return None
+
+    def rest_enableChargeTarget(self, enable):
+        """
+        Enable or disable the charge target SOC limit register via REST.
+        Without this being enabled, CHARGE_TARGET_SOC (reg 116) is ignored by the inverter.
+        No-ops if the register already matches the requested state.
+        """
+        current = self.rest_data["Control"].get("Enable_Charge_Target", "disable")
+        if isinstance(current, str):
+            current = current.lower() in ["enable", "on", "true"]
+        if current == enable:
+            return True
+
+        url = self.rest_api + "/enableChargeTarget"
+        data = {"state": "enable" if enable else "disable"}
+
+        for retry in range(INVERTER_MAX_RETRY_REST):
+            r = self.rest_postCommand(url, json=data)
+            self.rest_data = self.rest_runAll(self.rest_data)
+            new_value = self.rest_data["Control"].get("Enable_Charge_Target", "disable")
+            if isinstance(new_value, str):
+                new_value = new_value.lower() in ["enable", "on", "true"]
+            if new_value == enable:
+                self.count_register_writes += 1
+                self.base.log("Set inverter {} charge target enable {} via REST successful on retry {}".format(self.id, enable, retry))
+                return True
+            self.sleep(2)
+
+        self.base.log("Warn: Set inverter {} charge target enable {} via REST failed".format(self.id, enable))
+        self.base.record_status("Warn: Inverter {} REST failed to enableChargeTarget".format(self.id), had_errors=True)
+        return False
 
     def rest_setChargeTarget(self, target):
         """
