@@ -6372,15 +6372,20 @@ def get_plan_renderer_js():
             // Degradation labelling: LEFT table is always the ACTIVE (executing) plan;
             // RIGHT table is the comparison. degrad_in_effect True => low-power is live.
             const showDegrad = jsonData.degrad_rows && jsonData.degrad_rows.length > 0;
-            // Both plans are wear-scored by the degradation optimiser; the ACTIVE one is
-            // whichever has the lower total money+wear cost. degrad_in_effect True means
-            // the gentle low-power plan won this cycle.
-            const activeLow = !!jsonData.degrad_in_effect;
-            const leftMode = activeLow ? 'gentle low-power charging' : 'full-rate charging';
-            const rightMode = activeLow ? 'full-rate charging' : 'gentle low-power charging';
             const capBase = 'font-size:12px; padding:3px 8px; margin-bottom:4px; border-radius:4px; display:inline-block; color:#000';
-            const leftCap = '<div style="' + capBase + '; background:#c8e6c9"><b>ACTIVE</b> (lowest money + wear): ' + leftMode + '</div>';
-            const rightCap = '<div style="' + capBase + '; background:#e3f2fd"><b>Alternative</b> (not executing): ' + rightMode + '</div>';
+            let leftMode, rightMode;
+            if (jsonData.cost_objective_active) {
+                // Cost-objective mode: LEFT = executed degradation-aware plan, RIGHT = what
+                // predbat's default flat-wear model would have done.
+                leftMode = 'degradation-aware (physical wear model, executing)';
+                rightMode = "predbat default (flat wear, not executing)";
+            } else {
+                const activeLow = !!jsonData.degrad_in_effect;
+                leftMode = activeLow ? 'gentle low-power charging' : 'full-rate charging';
+                rightMode = activeLow ? 'full-rate charging' : 'gentle low-power charging';
+            }
+            const leftCap = '<div style="' + capBase + '; background:#c8e6c9"><b>ACTIVE</b>: ' + leftMode + '</div>';
+            const rightCap = '<div style="' + capBase + '; background:#e3f2fd"><b>Comparison</b>: ' + rightMode + '</div>';
             let html = '<div style="display:flex; gap:16px; overflow-x:auto; align-items:flex-start">';
             html += showDegrad ? ('<div>' + leftCap + '<table>') : '<table>';
             const cellStyle = 'style="padding: 4px;"';
