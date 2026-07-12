@@ -567,6 +567,12 @@ class Prediction:
         # Normally gated behind the user's set_charge_low_power option for save runs;
         # the degradation comparison forces it on (regardless of that option) so the
         # degradation-aware plan is free to explore gentler, slower charging.
+        # Low-power (spread) charging reduces charge C-rate and therefore wear.
+        # degradation_compare_low_power is now a CONTROLLED candidate flag (set only
+        # for the dedicated low-power candidate run in plan.py, which is scored on the
+        # true objective and kept only if it lowers J) — NOT force-enabled for every
+        # degradation run as before. That earlier forcing broke the "never worse than
+        # flat" property; scoring candidates restores it (see plan.py degradation block).
         set_charge_low_power = self.set_charge_window and (
             (self.set_charge_low_power and save in ["best", "best10", "test"])
             or getattr(self, "degradation_compare_low_power", False)
@@ -1301,16 +1307,18 @@ class Prediction:
         # Always expose final_degradation_weighted_cycle (record-bounded, like
         # final_battery_cycle) so the optimiser threads can read it back via self even
         # on non-save runs.
-        degradation_norm = getattr(self, "degradation_norm_factor", None)
-        if degradation_norm:
-            final_degradation_weighted_cycle *= degradation_norm
+        # FIX 2026-07-10: do NOT normalise the weighted cycle to the flat plan for
+        # the optimiser objective. Normalising (× flat_battery_cycle/flat_weighted_raw)
+        # destroyed the ABSOLUTE $ wear signal the optimiser must trade against money,
+        # was circular (the reference depends on the other plan), and — with uniform
+        # winter multipliers — collapsed to the flat metric while the forced low-power
+        # pass ballooned cycling. The objective now uses RAW physical wear
+        # (Σ throughput × multiplier); metric_battery_cycle prices it and the
+        # multiplier redistributes it toward gentle (low C-rate / mild temp / mid-SoC)
+        # slots. norm_factor is retained only as a display aid elsewhere.
         self.final_degradation_weighted_cycle = round(final_degradation_weighted_cycle, 4)
 
         if self.debug_enable or save:
-            # Scale the per-step multipliers for display onto the same normalised basis.
-            if degradation_norm:
-                for minute_key in self.predict_degradation_multiplier:
-                    self.predict_degradation_multiplier[minute_key] *= degradation_norm
             self.hours_left = hours_left
             self.final_car_soc = final_car_soc
             self.predict_car_soc_time = predict_car_soc_time

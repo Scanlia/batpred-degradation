@@ -593,6 +593,12 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.all_active_keep = {}
         self.set_charge_low_power = False
         self.set_export_low_power = False
+        # DEGRADATION: persisted auto low-power decision. When True, the degradation
+        # comparison found that gentle (low C-rate) charging lowers total economic
+        # cost (money + real wear), so we turn on predbat's native set_charge_low_power
+        # for the live plan + dispatch. Toggled with a deadband to prevent flapping.
+        self.degradation_force_low_power = False
+        self.degradation_plan_active = False
         self.config_root = "./"
         self.inverter_can_charge_during_export = True
         self.octopus_last_joined_try = None
