@@ -1675,19 +1675,31 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
                     chemistry=self.get_arg("degradation_chemistry", "LFP"),
                     battery_capacity_kwh=self.get_arg("degradation_battery_capacity", 24.0),
                     capex=self.get_arg("degradation_capex", 1000000),
-                    lifetime_cycles=self.get_arg("degradation_lifetime_cycles", 8000),
+                    lifetime_cycles=self.get_arg("degradation_lifetime_cycles", 10000),
                     nominal_c_rate=self.get_arg("degradation_nominal_c_rate", 0),
+                    calendar_life_years=self.get_arg("degradation_calendar_life_years", 15.0),
+                    eol_capacity_fade=self.get_arg("degradation_eol_capacity_fade", 0.30),
                 )
                 self.log(
-                    "Degradation model enabled: chemistry={}, baseline_cost={:.4f} c/kWh".format(
+                    "Degradation model enabled: chemistry={}, nominal throughput cost={:.3f} c/kWh (two-way), cost_objective={}".format(
                         self.degradation_model.chemistry,
-                        getattr(self, "metric_battery_cycle", self.degradation_model.baseline_cycle_cost()),
+                        self.degradation_model.throughput_cycle_cost(),
+                        getattr(self, "degradation_cost_enable", False),
                     )
                 )
             else:
                 self.degradation_enable = False
                 self.degradation_model = None
             self.degradation_compare_enable = self.degradation_enable and self.args.get("degradation_compare_enable", False)
+            # Phase 2: physical-wear-cost objective. When on, the optimiser trades money
+            # against real modelled wear (cents) instead of the flat metric_battery_cycle.
+            # degradation_cost_weight (0..1+) is a confidence dial for safe rollout.
+            self.degradation_cost_enable = self.degradation_enable and self.get_arg("degradation_cost_enable", False)
+            self.degradation_cost_weight = self.get_arg("degradation_cost_weight", 1.0)
+            # JIT charging: defer charge within a window to reach target near the window end
+            # (minimise high-SoC calendar dwell).  Default OFF — needs a charging scenario to
+            # validate, and dispatch alignment (set_charge_low_power / execute) before executing.
+            self.degradation_jit_charge = self.degradation_enable and self.get_arg("degradation_jit_charge", False)
             self._degradation_optimize = False
 
         except Exception as e:
