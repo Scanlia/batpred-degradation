@@ -970,6 +970,19 @@ class Plan:
 
         plan_start_time = time.time()
 
+        # DEGRADATION: apply the persisted auto low-power decision for THIS cycle.
+        # fetch_config_options() (run just before calculate_plan every update_pred)
+        # has already reset self.set_charge_low_power to the user's configured value,
+        # so OR-ing here (a) never turns off an explicit user set_charge_low_power:true
+        # and (b) turns it ON when our comparison last found gentle charging wins. This
+        # runs before the main optimise below and before execute_plan reads the flag, so
+        # both the planned and dispatched charge rate honour the decision, fresh every
+        # cycle (no stale windows). The wear-aware objective stays comparison-only; the
+        # executed plan is always predbat's money optimiser + native low-power charging.
+        self._degradation_low_power_config_baseline = bool(self.set_charge_low_power)
+        if getattr(self, "degradation_compare_enable", False) and getattr(self, "degradation_force_low_power", False):
+            self.set_charge_low_power = True
+
         # Re-compute plan due to time wrap
         if self.plan_last_updated_minutes > self.minutes_now:
             self.log("Force recompute due to start of day")
@@ -1407,50 +1420,107 @@ class Plan:
                         # flat plan rather than self-normalising it.
                         self.log("Degradation comparison: using norm_factor={:.4f}".format(getattr(self, "degradation_norm_factor", 1.0) or 1.0))
 
-                        # --- Degradation-aware pass ---
-                        # Optimise with the degradation-weighted cycle cost AND low-power
-                        # (slow) charging.  Rebuild the prediction so the main-process
-                        # object and the PRED_GLOBAL worker snapshot both carry the
-                        # low-power flag (and norm factor) from a clean cache, then re-fork
-                        # the pool so the worker processes actually inherit them.
-                        self._degradation_optimize = True
-                        self.degradation_compare_low_power = True
-                        self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
-                        # Cap degradation-pass workers to half the cores so this heavier
-                        # pass leaves host CPU/RAM headroom (it once thrashed the host).
+                        # --- Auto low-power decision (2026-07-12) — EXECUTED ---
+                        # Compare the money-optimal plan charged at FULL rate vs at LOW
+                        # (gentle, spread) rate on the SAME true objective
+                        #   J = money (import - export) + real μ-weighted wear (wear_c_total)
+                        # and toggle predbat's own set_charge_low_power for the LIVE plan when
+                        # gentle charging lowers J by more than the guard deadband (which
+                        # prevents flapping). Both candidates use the proven money optimiser;
+                        # the ONLY difference is the charge rate, so what we execute is exactly
+                        # what we scored, and the executed plan is never the (higher-risk)
+                        # wear-aware objective. One extra optimise (the non-current mode) —
+                        # the current mode is the main plan already computed this cycle.
+                        DEGRAD_LOW_POWER_GUARD_C = 1.0
                         degrad_max_workers = max(1, cpu_count() // 2)
-                        self.recreate_thread_pool(max_processes=degrad_max_workers)
-                        self.log("Degradation comparison: running degradation-aware optimizer with low-power charging ({} workers)".format(degrad_max_workers))
-                        self.optimise_all_windows(best_metric, metric_keep)
-                        # save="best" repopulates predict_*_best, predict_degradation_multiplier_best
-                        # and self.prediction.final_* from the degradation plan.
-                        self.run_prediction(
-                            self.charge_limit_best, self.charge_window_best,
-                            self.export_window_best, self.export_limits_best,
-                            False, save="best", end_record=self.end_record
-                        )
-                        _, degrad_raw = self.publish_html_plan(
-                            pv_forecast_minute_step, pv_forecast_minute10_step,
-                            load_minutes_step, load_minutes_step10, self.end_record,
-                            publish=False
-                        )
-                        self.degrad_plan_rows = degrad_raw.get("rows", [])
-                        self.degrad_plan_totals = degrad_raw.get("totals", {})
-                        dwc = getattr(self, "_degradation_weighted_cycle", 0)
-                        self.log("Degradation comparison: degrade_cycle_cost={:.2f}c".format(dwc * self.metric_battery_cycle))
+                        current_mode_low = bool(self.set_charge_low_power)
 
-                        # --- Restore the flat plan ---
-                        # Put the flat windows back, drop the degradation flags, rebuild the
-                        # prediction (flat, non-low-power) and re-run with save="best" so the
-                        # main table renders entirely from flat-plan data (predict_*_best,
-                        # multipliers and self.prediction.final_* all consistent).  The pool
-                        # is torn down at the end of optimise(), so no re-fork is needed here.
-                        self.charge_window_best = flat_charge_windows
-                        self.charge_limit_best = flat_charge_limits
-                        self.export_window_best = flat_export_windows
-                        self.export_limits_best = flat_export_limits
+                        # Snapshot the current-mode (main) executed windows.
+                        main_charge_windows = copy.deepcopy(flat_charge_windows)
+                        main_charge_limits = copy.deepcopy(flat_charge_limits)
+                        main_export_windows = copy.deepcopy(flat_export_windows)
+                        main_export_limits = copy.deepcopy(flat_export_limits)
+
+                        def _restore(cw, cl, ew, el):
+                            self.charge_window_best = copy.deepcopy(cw)
+                            self.charge_limit_best = copy.deepcopy(cl)
+                            self.export_window_best = copy.deepcopy(ew)
+                            self.export_limits_best = copy.deepcopy(el)
+
+                        def _render_score():
+                            # Render the current best windows (respecting the current
+                            # low-power flag) and return (J, raw) with J = money + wear.
+                            self.run_prediction(
+                                self.charge_limit_best, self.charge_window_best,
+                                self.export_window_best, self.export_limits_best,
+                                False, save="best", end_record=self.end_record)
+                            _, raw = self.publish_html_plan(
+                                pv_forecast_minute_step, pv_forecast_minute10_step,
+                                load_minutes_step, load_minutes_step10, self.end_record, publish=False)
+                            t = raw.get("totals", {}) or {}
+                            return (t.get("total_cost", 0.0) or 0.0) + (t.get("wear_c_total", 0.0) or 0.0), raw
+
+                        # Executed decision uses the money objective only.
                         self._degradation_optimize = False
                         self.degradation_compare_low_power = False
+
+                        # Score the current-mode main plan (already optimised this cycle).
+                        self.set_charge_low_power = current_mode_low
+                        self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                        _restore(main_charge_windows, main_charge_limits, main_export_windows, main_export_limits)
+                        j_main, raw_main = _render_score()
+
+                        # Optimise the ALTERNATIVE mode (the one extra optimise this cycle).
+                        alt_mode_low = not current_mode_low
+                        self.set_charge_low_power = alt_mode_low
+                        self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                        self.recreate_thread_pool(max_processes=degrad_max_workers)
+                        self.log("Degradation comparison: optimising {} plan ({} workers)".format("LOW-POWER" if alt_mode_low else "full-power", degrad_max_workers))
+                        _restore(main_charge_windows, main_charge_limits, main_export_windows, main_export_limits)
+                        self.optimise_all_windows(best_metric, metric_keep)
+                        j_alt, raw_alt = _render_score()
+                        alt_charge_windows = copy.deepcopy(self.charge_window_best)
+                        alt_charge_limits = copy.deepcopy(self.charge_limit_best)
+                        alt_export_windows = copy.deepcopy(self.export_window_best)
+                        alt_export_limits = copy.deepcopy(self.export_limits_best)
+
+                        # Map the two candidates onto full-power / low-power.
+                        if current_mode_low:
+                            j_low, raw_low = j_main, raw_main
+                            j_full, raw_full = j_alt, raw_alt
+                        else:
+                            j_full, raw_full = j_main, raw_main
+                            j_low, raw_low = j_alt, raw_alt
+
+                        # Decide: gentle charging only when it clearly wins (guard deadband).
+                        new_force_low = round(j_low + DEGRAD_LOW_POWER_GUARD_C, 2) < round(j_full, 2)
+                        self.degradation_force_low_power = new_force_low
+                        self.degradation_plan_active = new_force_low
+
+                        # Stable full / low plans for the tables + audit, independent of
+                        # which one is currently active.
+                        self.degradation_flat_totals = raw_full.get("totals", {})
+                        self.degradation_low_totals = raw_low.get("totals", {})
+                        self.degradation_flat_rows = raw_full.get("rows", [])
+                        self.degradation_low_rows = raw_low.get("rows", [])
+                        # Comparison (right) table = whichever plan is NOT active.
+                        if new_force_low:
+                            self.degrad_plan_rows = raw_full.get("rows", [])
+                            self.degrad_plan_totals = raw_full.get("totals", {})
+                        else:
+                            self.degrad_plan_rows = raw_low.get("rows", [])
+                            self.degrad_plan_totals = raw_low.get("totals", {})
+                        self.log("Degradation comparison: J full={:.2f} low={:.2f} (guard {:.1f}c) -> execute '{}' (force_low_power={})".format(
+                            j_full, j_low, DEGRAD_LOW_POWER_GUARD_C, "LOW-POWER" if new_force_low else "flat", new_force_low))
+
+                        # --- Restore the EXECUTED plan (fresh windows for the chosen mode) ---
+                        self._degradation_optimize = False
+                        self.degradation_compare_low_power = False
+                        self.set_charge_low_power = new_force_low or getattr(self, "_degradation_low_power_config_baseline", False)
+                        if new_force_low == current_mode_low:
+                            _restore(main_charge_windows, main_charge_limits, main_export_windows, main_export_limits)
+                        else:
+                            _restore(alt_charge_windows, alt_charge_limits, alt_export_windows, alt_export_limits)
                         self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
                         self.run_prediction(
                             self.charge_limit_best, self.charge_window_best,
@@ -1468,6 +1538,24 @@ class Plan:
                         self.degradation_compare_low_power = False
                         self.degrad_plan_rows = []
                         self.degrad_plan_totals = {}
+                        # SAFETY: a mid-comparison failure must not leave the executed plan
+                        # in the alternative mode's windows/charge-rate. Restore the flat
+                        # (current-mode) windows and the persisted low-power decision so
+                        # execute_plan dispatches a consistent plan this cycle.
+                        try:
+                            self.set_charge_low_power = getattr(self, "degradation_force_low_power", False) or getattr(self, "_degradation_low_power_config_baseline", False)
+                            self.charge_window_best = copy.deepcopy(flat_charge_windows)
+                            self.charge_limit_best = copy.deepcopy(flat_charge_limits)
+                            self.export_window_best = copy.deepcopy(flat_export_windows)
+                            self.export_limits_best = copy.deepcopy(flat_export_limits)
+                            self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                            self.run_prediction(
+                                self.charge_limit_best, self.charge_window_best,
+                                self.export_window_best, self.export_limits_best,
+                                False, save="best", end_record=self.end_record
+                            )
+                        except Exception as e2:
+                            self.log("Warn: Degradation comparison recovery failed: {}".format(e2))
 
                 # HTML data — publish both tables together with fresh degradation comparison
                 text = self.short_textual_plan(soc_min, soc_min_minute, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, self.end_record)

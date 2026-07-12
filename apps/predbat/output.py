@@ -1111,10 +1111,15 @@ class Output:
         raw_plan["degradation_compare_enable"] = getattr(self, "degradation_compare_enable", False)
         raw_plan["degrad_rows"] = getattr(self, "degrad_plan_rows", [])
         raw_plan["degrad_totals"] = getattr(self, "degrad_plan_totals", {})
-        # Whether the degradation-aware plan is actually controlling the battery.
-        # Currently predbat always executes the flat plan, so this is informational
-        # (the comparison table is shown for evaluation only).  Wire up later.
+        # Stable full-power vs low-power plan totals for the UI labels and the
+        # degradation audit, independent of which one is currently executing.
+        raw_plan["flat_totals"] = getattr(self, "degradation_flat_totals", {})
+        raw_plan["low_power_totals"] = getattr(self, "degradation_low_totals", {})
+        # Whether gentle (low C-rate) charging is actually controlling the battery
+        # this cycle.  When True the LEFT/active table is the low-power plan and the
+        # RIGHT/comparison table is the full-power flat plan; when False, vice-versa.
         raw_plan["degrad_in_effect"] = getattr(self, "degradation_plan_active", False)
+        raw_plan["active_plan"] = "low_power" if getattr(self, "degradation_plan_active", False) else "flat"
         # When the degradation comparison was last (re)computed.  The pass is
         # throttled (it does not run every cycle), so the table may reflect an
         # earlier snapshot than the flat plan; this lets the UI show "as of HH:MM".
