@@ -46,14 +46,14 @@ CHEMISTRY_PARAMETERS = {
         "label": "Lithium Iron Phosphate",
         "R": 8.314,
         "A_cal": 1.5e5,
-        "Ea_cal": 24000.0,
+        "Ea_cal": 24000.0,  # LFP calendar aging (research report; Naumann primary fit ~17126, tunable)
         "z_cal": 0.5,
         "A_cyc_discharge": 3.0e4,
         "A_cyc_charge": 3.5e4,
         "Ea_cyc_normal": 31700.0,
         "Ea_cyc_plating": -15000.0,
         "plating_threshold_k": 283.15,  # 10 C — plating onset for LFP
-        "z_cyc": 0.8,
+        "z_cyc": 0.55,  # Wang 2011 / Schimpe 0.5 (was 0.8, too high)
         "gamma_c_rate": 0.9,
         "nominal_c_rate": 0.15,  # reference C-rate where the cycle multiplier == 1.0
         "soc_stress_steepness": 5.0,
@@ -169,7 +169,7 @@ class DegradationModel:
     optimiser's decisions.
     """
 
-    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=8000, nominal_c_rate=None):
+    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=10000, nominal_c_rate=None, calendar_life_years=15.0, eol_capacity_fade=0.30, average_dod=1.0):
         """Initialise the degradation model.
 
         Args:
@@ -214,6 +214,22 @@ class DegradationModel:
         self.battery_capacity_kwh = battery_capacity_kwh
         self.capex = capex
         self.lifetime_cycles = lifetime_cycles
+
+        # Phase 1 (2026-07-12): physically-accurate absolute-cost anchors.
+        # calendar_life_years: years to reach eol_capacity_fade at nominal 25C / 50% SoC.
+        # eol_capacity_fade: fractional capacity loss defining end-of-life (0.20 = 80% SoH).
+        # average_dod: assumed average depth of discharge for the LCOS anchor.
+        self.calendar_life_years = calendar_life_years
+        self.eol_capacity_fade = eol_capacity_fade
+        self.average_dod = average_dod
+        # Calendar SoC-stress steepness in f_cal = 1 + exp(k*(SoC-0.8)).  Lowered from
+        # 5 to 3.5 per literature review: LFP calendar aging is fairly FLAT across SoC
+        # (Schimpe plateaus), so steepness 5 (~12x from 50->100%) over-penalised high SoC.
+        self.calendar_soc_steepness = 3.5
+        # Wang 2011: charging/high C-rate REDUCES the effective cycle activation energy
+        # (Ea_eff = Ea_cyc - wang_c_rate_coeff * C_rate), a mild WARM C-rate effect, rather
+        # than a strong unconditional C^gamma multiplier (Schimpe: ~no warm C-rate effect).
+        self.wang_c_rate_coeff = 370.3  # J/mol per C
 
         # Cumulative state — use 1.0 as initial to avoid the derivative
         # singularity at t=0 (z * t^(z-1) → ∞ as t → 0 for z < 1).
@@ -370,6 +386,170 @@ class DegradationModel:
             delta_throughput_kwh=ref_kwh,
             delta_time_hours=5.0 / 60.0,
             is_charging=is_charging,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 1 (2026-07-12): physically-accurate ABSOLUTE wear cost (cents)
+    #
+    # These stateless methods return real currency cost (same unit as capex)
+    # for a single step, split into cycle wear (throughput driven) and calendar
+    # wear (time driven, applies even when idle).  Both are self-calibrated so
+    # that total lifetime wear at nominal conditions equals one capex:
+    #   - cycle:    nominal-C-rate / 25C cycling costs the LCOS per kWh.
+    #   - calendar: nominal-SoC(50%) / 25C ageing consumes eol_capacity_fade
+    #               over calendar_life_years (i.e. one capex over the calendar life).
+    # SoC-stress lives on the CALENDAR term (where it physically belongs: a cell
+    # ages faster sitting at high SoC), NOT bolted onto cycle wear as before.
+    # These supersede the multiplier/accumulate_wear helpers for the Phase 2
+    # objective; the older methods are left intact for display back-compat.
+    # ------------------------------------------------------------------
+
+    def calendar_soc_stress(self, soc_decimal):
+        """Calendar-ageing SoC stress f(SoC) = 1 + exp(k*(SoC - 0.8)), k=calendar_soc_steepness.
+
+        Flat/benign across low-mid SoC, rising toward high SoC (SEI growth driven by the
+        elevated graphite-anode potential + Fe dissolution above ~80%).  Steepness reduced
+        to 3.5 per literature (LFP calendar aging is relatively flat vs SoC).  Naumann/Schimpe.
+        """
+        s = min(max(soc_decimal, 0.0), 1.0)
+        return 1.0 + math.exp(self.calendar_soc_steepness * (s - 0.8))
+
+    def cycle_soc_stress(self, soc_decimal, is_charging):
+        """Cycle-ageing SoC stress (per-direction), from LFP research.
+
+        Charging near full drives lithium plating and rising insertion resistance:
+            f_charge(SoC)    = 1 + 4*exp(10*(SoC - 0.8))
+        Discharging deep drives polarisation heat and copper-dissolution stress:
+            f_discharge(SoC) = 1 + 5*exp(-15*SoC)
+        Both ~1.0 through the benign mid-SoC band.  Refs: iScience 2024 zero-sum
+        pulse study (90% SoC ~ an order of magnitude worse than 30-50%), Schimpe
+        2018 decoupled high-SoC cycle stress.
+        """
+        s = min(max(soc_decimal, 0.0), 1.0)
+        if is_charging:
+            return 1.0 + 4.0 * math.exp(10.0 * (s - 0.8))
+        return 1.0 + 5.0 * math.exp(-15.0 * s)
+
+    def safe_charge_c_rate(self, temp_c):
+        """Maximum charge C-rate before lithium plating, from LFP low-temperature
+        charging guidance: ~0.1C at 0C, ~0.05C at -10C, effectively unrestricted
+        at/above 15C.  The SigenStor heating pad keeps cells warm (live cell temp
+        ~16C), so in practice this band is rarely entered.
+        """
+        if temp_c >= 25.0:
+            return 99.0  # unrestricted only once genuinely warm
+        if temp_c >= 15.0:
+            return 1.0 + ((temp_c - 15.0) / 10.0) * (5.0 - 1.0)  # 1C @15C -> 5C @25C (graded, Schimpe)
+        if temp_c >= 0.0:
+            return 0.1 + (temp_c / 15.0) * (1.0 - 0.1)  # 0.1C @0C -> 1.0C @15C
+        if temp_c >= -10.0:
+            return 0.05 + ((temp_c + 10.0) / 10.0) * (0.1 - 0.05)  # 0.05C @-10C -> 0.1C @0C
+        return 0.02
+
+    def plating_factor(self, temp_c, c_rate):
+        """Cold + fast charge lithium-plating penalty, C-RATE GATED.
+
+        Plating is a kinetic process needing BOTH low temperature AND a charge
+        current faster than the anode can intercalate.  Slow charging is safe even
+        when cold, so there is NO penalty at or below safe_charge_c_rate(temp).
+        Above it the penalty grows smoothly (no cliff).  This is the research
+        report's cold-charge mechanism made C-rate dependent per the LFP
+        low-temperature charging literature.
+        """
+        safe = self.safe_charge_c_rate(temp_c)
+        if c_rate <= safe:
+            return 1.0
+        excess = c_rate / max(safe, 1e-3)
+        return min(1.0 + 3.0 * (excess - 1.0) ** 2, 40.0)
+
+    def cycle_wear_multiplier(self, temp_c, soc_percent, c_rate, is_charging):
+        """Cycle-wear ratio vs nominal (nominal = 0.2C, 25C, discharge, mid-SoC = 1.0).
+
+        Combines Arrhenius temperature (with Wang 2011 C-rate-in-Ea, so WARM C-rate has
+        only a mild effect), charge/discharge asymmetry, per-direction SoC stress, and
+        (charge only) the cold+fast lithium-plating penalty which carries the strong
+        C-rate deterrent.  Replaces the earlier unconditional C^gamma multiplier, which
+        overstated warm fast-charge wear (Schimpe: ~no warm C-rate dependence).
+        """
+        temp_k = temp_c + 273.15
+        T_ref = 298.15
+        c_rate = max(c_rate, 0.001)
+        # Wang 2011: higher C-rate lowers the effective activation energy (mild, warm).
+        ea_eff = self.Ea_cyc_normal - self.wang_c_rate_coeff * c_rate
+        ea_eff_nom = self.Ea_cyc_normal - self.wang_c_rate_coeff * self.nominal_c_rate
+        arr = math.exp(-ea_eff / (self.R * temp_k))
+        arr_ref = math.exp(-ea_eff_nom / (self.R * T_ref))
+        if arr_ref <= 0:
+            return 0.0
+        if is_charging:
+            A = self.A_cyc_charge
+            plating = self.plating_factor(temp_c, c_rate)
+        else:
+            A = self.A_cyc_discharge
+            plating = 1.0
+        soc_stress = self.cycle_soc_stress(soc_percent / 100.0, is_charging)
+        # Reference denominator: discharge at nominal C-rate, 25C, mid-SoC (stress ~ 1).
+        mult = (A * arr * plating * soc_stress) / (self.A_cyc_discharge * arr_ref)
+        return min(max(mult, 0.0), 100.0)
+
+    def throughput_cycle_cost(self):
+        """Cost (cents) per kWh of TWO-WAY throughput at nominal conditions.
+
+        Warranty basis: `lifetime_cycles` FULL cycles (one full charge + one full discharge
+        each) to end-of-life.  predbat counts throughput two-way (|charge| + |discharge|),
+        and one full cycle moves 2*capacity kWh two-way, so the nominal cost per kWh of
+        two-way throughput is capex / (lifetime_cycles * 2 * capacity).  This avoids the
+        double-count that arises from applying a one-way LCOS to two-way throughput.
+        """
+        denom = self.lifetime_cycles * 2.0 * self.battery_capacity_kwh
+        return self.capex / denom if denom > 0 else 0.0
+
+    def cycle_cost_cents(self, temp_c, soc_percent, delta_throughput_kwh, delta_time_hours, is_charging):
+        """Absolute cycle-wear cost (cents) for this step's throughput.
+
+        = nominal_throughput_cost x cycle_wear_multiplier x throughput.  At nominal (0.2C,
+        25C, discharge, mid-SoC) the multiplier is 1.0; gentle/mild costs less, harsh/
+        cold-fast/high-SoC costs more.  `delta_throughput_kwh` is one direction's move for
+        this step; summed over charge and discharge it matches predbat's two-way counting.
+        """
+        if delta_throughput_kwh <= 0:
+            return 0.0
+        c_rate = (delta_throughput_kwh / max(delta_time_hours, 1e-6)) / self.battery_capacity_kwh
+        mult = max(self.cycle_wear_multiplier(temp_c, soc_percent, c_rate, is_charging), self.min_multiplier)
+        return self.throughput_cycle_cost() * mult * delta_throughput_kwh
+
+    def calendar_cost_cents(self, temp_c, soc_percent, delta_time_hours, marginal=True):
+        """Absolute calendar-wear cost (cents) for this step's duration.
+
+        Applies EVERY step (idle included).  Anchored so the calendar-depreciation
+        rate is capex / (calendar_life_years * 8760h), scaled by the SoC-stress
+        shape f(SoC) = 1 + exp(5*(SoC-0.8)) and by temperature (Arrhenius).
+
+        marginal=True (default) uses only the SoC-controllable part (f(SoC) - 1),
+        i.e. the cost ABOVE the flat low-SoC baseline.  That flat baseline is the
+        same for every candidate plan of equal duration (the pack ages with
+        wall-clock time regardless of what predbat does), so it cancels in the
+        optimiser and is dropped.  marginal=False gives the full physical cost.
+        """
+        if self.calendar_life_years <= 0 or delta_time_hours <= 0:
+            return 0.0
+        temp_k = temp_c + 273.15
+        T_ref = 298.15
+        arrhenius = math.exp(-self.Ea_cal / (self.R * temp_k)) / math.exp(-self.Ea_cal / (self.R * T_ref))
+        fcal = self.calendar_soc_stress(soc_percent / 100.0)
+        stress = (fcal - 1.0) if marginal else fcal
+        nominal_cents_per_hour = self.capex / (self.calendar_life_years * 8760.0)
+        return nominal_cents_per_hour * arrhenius * stress * delta_time_hours
+
+    def step_wear_cost_cents(self, temp_c, soc_percent, delta_throughput_kwh, delta_time_hours, is_charging, calendar_marginal=True):
+        """Total physical wear cost (cents) for one step: cycle + calendar.
+
+        Stateless and thread-safe.  This is the term the Phase 2 objective will
+        sum over the plan and add to the money cost, replacing the flat
+        ``battery_cycle x metric_battery_cycle`` cost.
+        """
+        return self.cycle_cost_cents(temp_c, soc_percent, delta_throughput_kwh, delta_time_hours, is_charging) + self.calendar_cost_cents(
+            temp_c, soc_percent, delta_time_hours, marginal=calendar_marginal
         )
 
     def flush_step_multipliers(self):

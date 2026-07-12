@@ -2354,4 +2354,9 @@ APPS_SCHEMA = {
     "degradation_battery_capacity": {"type": "float"},
     "degradation_nominal_c_rate": {"type": "float"},
     "degradation_compare_enable": {"type": "boolean"},
+    "degradation_calendar_life_years": {"type": "float"},
+    "degradation_eol_capacity_fade": {"type": "float"},
+    "degradation_cost_enable": {"type": "boolean"},
+    "degradation_cost_weight": {"type": "float"},
+    "degradation_jit_charge": {"type": "boolean"},
 }

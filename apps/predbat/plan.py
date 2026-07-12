@@ -980,7 +980,16 @@ class Plan:
         # cycle (no stale windows). The wear-aware objective stays comparison-only; the
         # executed plan is always predbat's money optimiser + native low-power charging.
         self._degradation_low_power_config_baseline = bool(self.set_charge_low_power)
-        if getattr(self, "degradation_compare_enable", False) and getattr(self, "degradation_force_low_power", False):
+        # Phase 3 cleanup (2026-07-12): the old full-vs-gentle force-low-power toggle is
+        # RETIRED when the physical-cost objective is active — the cost objective prices
+        # C-rate wear natively (and per the literature, warm C-rate barely matters), so it
+        # decides the charge rate itself. Only apply the legacy force toggle when the cost
+        # objective is OFF (Phase-1 comparison-only mode).
+        if (
+            getattr(self, "degradation_compare_enable", False)
+            and getattr(self, "degradation_force_low_power", False)
+            and not getattr(self, "degradation_cost_enable", False)
+        ):
             self.set_charge_low_power = True
 
         # Re-compute plan due to time wrap
@@ -1353,7 +1362,10 @@ class Plan:
                     flat_battery_cycle_raw = getattr(self.prediction, "final_battery_cycle", 0.0)
                     flat_weighted_raw = getattr(self.prediction, "final_degradation_weighted_cycle", 0.0)
                     self.degradation_norm_factor = (flat_battery_cycle_raw / flat_weighted_raw) if flat_weighted_raw > 0 else 1.0
-                    self.log("Degradation norm_factor={:.4f} (flat battery_cycle={:.3f}, weighted_raw={:.3f})".format(self.degradation_norm_factor, flat_battery_cycle_raw, flat_weighted_raw))
+                    # In cost-objective mode final_degradation_weighted_cycle carries the wear
+                    # COST (cents), so norm_factor is meaningless there — suppress the log.
+                    if not getattr(self, "degradation_cost_enable", False):
+                        self.log("Degradation norm_factor={:.4f} (flat battery_cycle={:.3f}, weighted_raw={:.3f})".format(self.degradation_norm_factor, flat_battery_cycle_raw, flat_weighted_raw))
                     self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
                     self.run_prediction(
                         self.charge_limit_best, self.charge_window_best,
@@ -1401,9 +1413,18 @@ class Plan:
                     self.degradation_last_compare_ts = degrad_last_ts
                     self.log("Degradation comparison: first pass deferred {:.0f}s after startup".format(DEGRADATION_STARTUP_DEFER_S))
                 degrad_due = (degrad_now_ts - degrad_last_ts) >= DEGRADATION_COMPARE_INTERVAL_S
-                if getattr(self, "degradation_compare_enable", False) and hasattr(self, "degradation_model") and self.degradation_model and not degrad_due:
+                # Phase 3 cleanup: skip the whole flat-vs-low-power candidate selection when
+                # the physical-cost objective is active — it is superseded by the cost
+                # objective (which the main optimise now uses natively every cycle).
+                _run_compare = (
+                    getattr(self, "degradation_compare_enable", False)
+                    and hasattr(self, "degradation_model")
+                    and self.degradation_model
+                    and not getattr(self, "degradation_cost_enable", False)
+                )
+                if _run_compare and not degrad_due:
                     self.log("Degradation comparison: throttled, reusing cached plan (next recompute in {:.0f}s)".format(DEGRADATION_COMPARE_INTERVAL_S - (degrad_now_ts - degrad_last_ts)))
-                if getattr(self, "degradation_compare_enable", False) and hasattr(self, "degradation_model") and self.degradation_model and degrad_due:
+                if _run_compare and degrad_due:
                     try:
                         # Save the flat plan's window definitions so we can restore and
                         # re-render the main table after the degradation pass.
@@ -1557,6 +1578,79 @@ class Plan:
                         except Exception as e2:
                             self.log("Warn: Degradation comparison recovery failed: {}".format(e2))
 
+                # --- Comparison (cost-objective mode): executed degradation-aware plan vs
+                # predbat's DEFAULT flat-wear plan (money + flat metric_battery_cycle, no
+                # degradation).  Shown in the second table and logged for the audit.  The main
+                # optimise above already produced the executed wear-aware plan; here we run ONE
+                # extra optimise with the cost objective temporarily off to get predbat's
+                # default plan.  Throttled to DEGRADATION_COMPARE_INTERVAL_S.
+                if (
+                    getattr(self, "degradation_compare_enable", False)
+                    and hasattr(self, "degradation_model") and self.degradation_model
+                    and getattr(self, "degradation_cost_enable", False)
+                ):
+                    if not degrad_due:
+                        self.log("Default-plan comparison: throttled, reusing cached (next in {:.0f}s)".format(DEGRADATION_COMPARE_INTERVAL_S - (degrad_now_ts - degrad_last_ts)))
+                    else:
+                        _dm_workers = max(1, cpu_count() // 2)
+                        _dm_exec = (
+                            copy.deepcopy(self.charge_window_best), copy.deepcopy(self.charge_limit_best),
+                            copy.deepcopy(self.export_window_best), copy.deepcopy(self.export_limits_best),
+                        )
+
+                        def _dm_set(w):
+                            self.charge_window_best = copy.deepcopy(w[0])
+                            self.charge_limit_best = copy.deepcopy(w[1])
+                            self.export_window_best = copy.deepcopy(w[2])
+                            self.export_limits_best = copy.deepcopy(w[3])
+
+                        def _dm_render():
+                            self.run_prediction(self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, False, save="best", end_record=self.end_record)
+                            _, raw = self.publish_html_plan(pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, self.end_record, publish=False)
+                            return raw
+
+                        try:
+                            self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                            _dm_set(_dm_exec)
+                            raw_active = _dm_render()
+                            # predbat-default flat plan: temporarily disable the cost objective so
+                            # compute_metric uses the flat metric_battery_cycle path.
+                            self.degradation_cost_enable = False
+                            self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                            self.recreate_thread_pool(max_processes=_dm_workers)
+                            self.log("Default-plan comparison: optimising predbat-default flat plan ({} workers)".format(_dm_workers))
+                            _dm_set(_dm_exec)
+                            self.optimise_all_windows(best_metric, metric_keep)
+                            raw_default = _dm_render()
+                            self.degradation_cost_enable = True
+                            self.degrad_plan_rows = raw_default.get("rows", [])
+                            self.degrad_plan_totals = raw_default.get("totals", {})
+                            self.degradation_default_totals = raw_default.get("totals", {})
+                            self.degradation_active_totals = raw_active.get("totals", {})
+                            self.degradation_plan_active = True
+                            at = raw_active.get("totals", {}) or {}
+                            dt = raw_default.get("totals", {}) or {}
+                            self.log("Default-plan comparison: wear-aware cost={:.1f}c wear={:.1f}c cyc={:.2f} | predbat-default cost={:.1f}c wear={:.1f}c cyc={:.2f}".format(
+                                at.get("total_cost", 0) or 0, at.get("wear_c_total", 0) or 0, at.get("battery_cycle", 0) or 0,
+                                dt.get("total_cost", 0) or 0, dt.get("wear_c_total", 0) or 0, dt.get("battery_cycle", 0) or 0))
+                            _dm_set(_dm_exec)
+                            self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                            self.run_prediction(self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, False, save="best", end_record=self.end_record)
+                            self.degradation_last_compare_ts = degrad_now_ts
+                            self.degradation_last_compare_iso = self.now_utc_real.strftime("%H:%M")
+                        except Exception as e:
+                            self.log("Warn: Default-plan comparison failed: {}".format(e))
+                            self.log(traceback.format_exc())
+                            self.degradation_cost_enable = True
+                            self.degrad_plan_rows = []
+                            self.degrad_plan_totals = {}
+                            try:
+                                _dm_set(_dm_exec)
+                                self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                                self.run_prediction(self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, False, save="best", end_record=self.end_record)
+                            except Exception as e2:
+                                self.log("Warn: Default-plan comparison recovery failed: {}".format(e2))
+
                 # HTML data — publish both tables together with fresh degradation comparison
                 text = self.short_textual_plan(soc_min, soc_min_minute, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, self.end_record)
                 text_lines = text.split("\n")
@@ -1616,8 +1710,16 @@ class Plan:
         # Self sufficiency metric
         metric += (import_kwh_house + import_kwh_battery) * self.metric_self_sufficiency
 
-        # Adjustment for battery cycles metric — use degradation-weighted when in degrade optimization mode
-        if getattr(self, "_degradation_optimize", False) and getattr(self, "degradation_model") and self.degradation_model:
+        # Adjustment for battery cycles metric.
+        # Phase 2 (2026-07-12): when the physical-cost objective is active,
+        # `degradation_weighted_cycle` carries the REAL wear cost in cents (cycle +
+        # calendar, from the degradation model in prediction.py), so it REPLACES the flat
+        # `battery_cycle * metric_battery_cycle` term.  degradation_cost_weight (default
+        # 1.0) is a confidence dial for safe rollout: 0 = money only, 1 = full physical wear.
+        if getattr(self, "degradation_cost_enable", False) and getattr(self, "degradation_model", None):
+            wear_cost = degradation_weighted_cycle if degradation_weighted_cycle is not None else 0.0
+            metric += wear_cost * getattr(self, "degradation_cost_weight", 1.0) + metric_keep
+        elif getattr(self, "_degradation_optimize", False) and getattr(self, "degradation_model") and self.degradation_model:
             if degradation_weighted_cycle is None:
                 degradation_weighted_cycle = battery_cycle
             blc = self.metric_battery_cycle

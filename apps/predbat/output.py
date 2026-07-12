@@ -1111,15 +1111,20 @@ class Output:
         raw_plan["degradation_compare_enable"] = getattr(self, "degradation_compare_enable", False)
         raw_plan["degrad_rows"] = getattr(self, "degrad_plan_rows", [])
         raw_plan["degrad_totals"] = getattr(self, "degrad_plan_totals", {})
-        # Stable full-power vs low-power plan totals for the UI labels and the
-        # degradation audit, independent of which one is currently executing.
+        # Legacy (Phase-1 flat-vs-low-power) totals, kept for back-compat.
         raw_plan["flat_totals"] = getattr(self, "degradation_flat_totals", {})
         raw_plan["low_power_totals"] = getattr(self, "degradation_low_totals", {})
-        # Whether gentle (low C-rate) charging is actually controlling the battery
-        # this cycle.  When True the LEFT/active table is the low-power plan and the
-        # RIGHT/comparison table is the full-power flat plan; when False, vice-versa.
-        raw_plan["degrad_in_effect"] = getattr(self, "degradation_plan_active", False)
-        raw_plan["active_plan"] = "low_power" if getattr(self, "degradation_plan_active", False) else "flat"
+        # Cost-objective comparison pair: the EXECUTED degradation-aware plan vs what
+        # predbat's DEFAULT flat-wear model would have planned (both money+wear totals),
+        # for the second table + the audit.
+        cost_mode = getattr(self, "degradation_cost_enable", False)
+        raw_plan["cost_objective_active"] = cost_mode
+        raw_plan["active_totals"] = getattr(self, "degradation_active_totals", {})
+        raw_plan["default_totals"] = getattr(self, "degradation_default_totals", {})
+        # In cost mode the LEFT/active table is always the degradation-aware executed plan and
+        # the RIGHT/comparison table is the predbat-default flat plan.
+        raw_plan["degrad_in_effect"] = True if cost_mode else getattr(self, "degradation_plan_active", False)
+        raw_plan["active_plan"] = "degradation_aware" if cost_mode else ("low_power" if getattr(self, "degradation_plan_active", False) else "flat")
         # When the degradation comparison was last (re)computed.  The pass is
         # throttled (it does not run every cycle), so the table may reflect an
         # earlier snapshot than the flat plan; this lets the UI show "as of HH:MM".
@@ -1299,15 +1304,18 @@ class Output:
                 else:
                     wear_c_rate = 0.0
 
-                # Cycle wear cost for this row (cents)
-                if degradation_mult_row > 0 and abs(soc_change) > 0.01:
-                    wear_c = round(abs(soc_change) * blc * degradation_mult_row, 2)
-
-                # Calendar aging cost: always present (battery ages 24/7)
-                soc_d = mid_soc / 100.0
-                cal_stress = self.degradation_model.soc_stress_factor(soc_d)
-                cal_temp = math.exp(-24000.0 / (8.314 * (temp_c + 273.15))) / math.exp(-24000.0 / (8.314 * 298.15))
-                calendar_cost = round(0.01 * cal_stress * cal_temp, 2)
+                # Wear cost for this row (cents) — SAME physical model as the optimiser
+                # objective (cycle cost on throughput + marginal calendar cost on time), so
+                # the displayed wear matches what the planner actually optimises.
+                dt_hours = (minute_end - minute_start) / 60.0
+                if abs(soc_change) > 0.01:
+                    wear_c = self.degradation_model.cycle_cost_cents(
+                        temp_c=temp_c, soc_percent=mid_soc,
+                        delta_throughput_kwh=abs(soc_change), delta_time_hours=dt_hours, is_charging=is_chg,
+                    )
+                calendar_cost = self.degradation_model.calendar_cost_cents(
+                    temp_c=temp_c, soc_percent=mid_soc, delta_time_hours=dt_hours, marginal=True,
+                )
                 wear_c = round(wear_c + calendar_cost, 2)
 
                 degrad_wear_c_total += wear_c
