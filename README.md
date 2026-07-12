@@ -4,6 +4,12 @@
 ![image](https://github.com/springfall2008/batpred/actions/workflows/publish-docs.yml/badge.svg)
 ![image](https://github.com/springfall2008/batpred/actions/workflows/pages/pages-build-deployment/badge.svg)
 
+> **⚡ This is a degradation-aware fork of [springfall2008/batpred](https://github.com/springfall2008/batpred).**
+> It adds a physics-based battery **wear model** and **automatic gentle (low-power) charging** so the
+> planner trades off money **and** real battery degradation, not money alone. Everything upstream still
+> works unchanged; see [Degradation fork additions](#-degradation-fork-additions) for what's new.
+> Full credit for Predbat itself goes to Trefor Southwell (@springfall2008).
+
 ## Introduction
 
 Home battery prediction and automatic charging for Home Assistant supporting multiple inverters, including GivEnergy, Solis, Huawei, SolarEdge, SigEnergy, FoxESS, Sofar, Tesla Powerwall and many more.
@@ -19,6 +25,48 @@ If you want to buy me a beer, then please use [Paypal](https://paypal.me/predbat
 * Use my referral code for Axle Energy (UK): <https://vpp.axle.energy/landing/grid?ref=R-VWIICRSA>
 
 If you find Home Assistant and Predbat too difficult to set up yourself, there is now [PredBat Cloud](https://predbat.com/), a paid version of Predbat hosted in the cloud. Please note that while I have given permission for PredBat Cloud to operate under license, PredBat will remain open source for personal use.
+
+## 🔋 Degradation fork additions
+
+Standard Predbat prices battery use with a single flat `metric_battery_cycle` cost per kWh of
+throughput, so every cycle costs the same regardless of charge rate or temperature. Real LFP batteries
+don't wear like that: **high C-rate and extreme temperatures accelerate degradation**. This fork models
+that and lets the planner exploit it.
+
+The fork compares two plans and picks the cheaper on total cost:
+
+* the **standard plan** (upstream behaviour: full charge rate, money-optimal), and
+* the **degradation-aware plan** (gentle, low-power charging that reduces C-rate wear).
+
+What it adds on top of upstream Predbat:
+
+* **Physics-based wear model** (`apps/predbat/degradation.py`): a per-step degradation multiplier `μ`
+  driven by **charge/discharge C-rate** and **battery temperature**, calibrated to the cell's rated
+  cycle life (LCOS ≈ capex / (capacity · cycles · depth-of-discharge)). Gentle charging at mild
+  temperatures wears the pack far less than a hard, cold fast-charge.
+* **True economic objective**: plans are scored on `J = money (import minus export) + real μ-weighted
+  wear` instead of money plus a flat cycle cost. Wear is priced at its actual modelled cost, so the
+  optimiser will spend a fraction of a cent of energy to avoid a larger chunk of battery wear (and
+  vice versa).
+* **Automatic low-power (gentle) charging, executed live.** Every ~30 min the fork optimises the plan at
+  **full charge rate** and at **low (spread) charge rate**, scores both on `J`, and automatically toggles
+  Predbat's native `set_charge_low_power` for the live plan **only when gentle charging clearly lowers
+  total cost** (a deadband prevents flapping). This reuses Predbat's own battle-tested charge-rate
+  dispatch, so what runs is exactly what was scored, and never worse than the standard plan.
+* **Side-by-side comparison UI**: the plan page shows the **ACTIVE** (executing) plan next to the
+  **comparison** plan, with extra `Wear x` / `Wear c` columns, so you can see the money vs degradation
+  trade-off the optimiser is making at a glance.
+* **Degradation audit and forecast logging**: optional helpers snapshot each standard vs low-power pair
+  to CSV and log forward energy rates and PV forecasts, for offline what-if analysis and validation.
+* **Reproducible overlay build**: a **digest-pinned** upstream base image with our modified source files
+  layered on top, so upstream can be re-based deliberately without the base silently moving under us.
+
+Enable it with the `degradation_enable` / `degradation_compare_enable` options plus your cell's
+`degradation_lifetime_cycles` and `degradation_nominal_c_rate`; leave them off and Predbat behaves
+exactly like upstream.
+
+> ⚠️ Experimental. This controls a real battery. Start with `degradation_compare_enable` (comparison
+> only, does not touch dispatch), watch the audit pairs, and only then enable execution.
 
 ## Predbat documentation
 
