@@ -497,6 +497,9 @@ class Prediction:
             and self.base is not None
             and getattr(self.base, "degradation_enable", False)
         )
+        # JIT charge: defer charging within a window so SoC reaches target near the window
+        # END rather than the start, minimising high-SoC calendar dwell.  Flag-gated.
+        jit_charge = degradation_enable and getattr(self.base, "degradation_jit_charge", False)
         metric_keep = 0
         four_hour_rule = True
         final_export_kwh = export_kwh
@@ -973,8 +976,12 @@ class Prediction:
 
                 # Once force discharge starts the four hour rule is disabled
                 four_hour_rule = False
-            elif charge_window_active and soc < charge_limit_n:
-                # Charge enable
+            elif charge_window_active and soc < charge_limit_n and (
+                (not jit_charge)
+                or (charge_window_n < 0)
+                or (minute_absolute >= (charge_window[charge_window_n]["end"] - ((charge_limit_n - soc) / max(battery_rate_max_charge * 0.8, 1e-6)) - 30))
+            ):
+                # Charge enable (JIT: only once late enough to reach target by window end)
                 # Only tune charge rate on final plan not every simulation
                 if inverter_hybrid and (battery_rate_max_charge_dc > battery_rate_max_charge):
                     # For a hybrid inverter if the DC rate is higher than the max charge rate then we can use some of the extra for PV charging.
@@ -1175,10 +1182,17 @@ class Prediction:
             # Count battery cycles
             battery_cycle = battery_cycle + abs(battery_draw)
 
-            # Degradation-weighted cycle counting
+            # Degradation-weighted cycle counting.
+            # Phase 2 (2026-07-12): when the physical-cost objective is active, the shared
+            # `degradation_weighted_cycle` channel (already threaded through every optimise
+            # tuple) instead carries the ABSOLUTE physical wear COST in cents (cycle wear on
+            # throughput + calendar wear on time, applied EVERY step incl. idle).  This
+            # avoids invasive changes to the multiprocessing result tuples.  The per-step
+            # multiplier is still recorded for the display column either way.
             if degradation_enable:
                 degradation_multiplier = 1.0
-                if hasattr(self, "base") and self.base is not None and hasattr(self.base, "degradation_model") and self.base.degradation_model:
+                have_model = hasattr(self, "base") and self.base is not None and hasattr(self.base, "degradation_model") and self.base.degradation_model
+                if have_model:
                     degradation_multiplier = self.base.degradation_model.compute_step_degradation_multiplier(
                         temp_c=battery_temperature,
                         soc_percent=(soc / soc_max * 100.0) if soc_max > 0 else 50.0,
@@ -1186,8 +1200,17 @@ class Prediction:
                         delta_time_hours=step / 60.0,
                         is_charging=(battery_draw < 0),
                     )
-                degradation_weighted_cycle += abs(battery_draw) * degradation_multiplier
                 self.predict_degradation_multiplier[minute_absolute] = degradation_multiplier
+                if have_model and getattr(self.base, "degradation_cost_enable", False):
+                    degradation_weighted_cycle += self.base.degradation_model.step_wear_cost_cents(
+                        temp_c=battery_temperature,
+                        soc_percent=(soc / soc_max * 100.0) if soc_max > 0 else 50.0,
+                        delta_throughput_kwh=abs(battery_draw),
+                        delta_time_hours=step / 60.0,
+                        is_charging=(battery_draw < 0),
+                    )
+                else:
+                    degradation_weighted_cycle += abs(battery_draw) * degradation_multiplier
 
             # Work out left over energy after battery adjustment
             diff = get_diff(battery_draw, pv_dc, pv_ac, load_yesterday, inverter_loss, inverter_loss_recp)
