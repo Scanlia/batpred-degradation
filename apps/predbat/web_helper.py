@@ -6417,7 +6417,20 @@ def get_plan_renderer_js():
             // the History/Yesterday views publish their own copy alongside their own rows.
             const reasonTemplates = jsonData.reason_templates;
 
-            let html = '<div style="display:flex; gap:16px; overflow-x:auto; align-items:flex-start"><table>';
+            // Degradation labelling: LEFT table is always the ACTIVE (executing) plan;
+            // RIGHT table is the comparison. degrad_in_effect True => low-power is live.
+            const showDegrad = jsonData.degrad_rows && jsonData.degrad_rows.length > 0;
+            // Both plans are wear-scored by the degradation optimiser; the ACTIVE one is
+            // whichever has the lower total money+wear cost. degrad_in_effect True means
+            // the gentle low-power plan won this cycle.
+            const activeLow = !!jsonData.degrad_in_effect;
+            const leftMode = activeLow ? 'gentle low-power charging' : 'full-rate charging';
+            const rightMode = activeLow ? 'full-rate charging' : 'gentle low-power charging';
+            const capBase = 'font-size:12px; padding:3px 8px; margin-bottom:4px; border-radius:4px; display:inline-block; color:#000';
+            const leftCap = '<div style="' + capBase + '; background:#c8e6c9"><b>ACTIVE</b> (lowest money + wear): ' + leftMode + '</div>';
+            const rightCap = '<div style="' + capBase + '; background:#e3f2fd"><b>Alternative</b> (not executing): ' + rightMode + '</div>';
+            let html = '<div style="display:flex; gap:16px; overflow-x:auto; align-items:flex-start">';
+            html += showDegrad ? ('<div>' + leftCap + '<table>') : '<table>';
             const cellStyle = 'style="padding: 4px;"';
 
             // Render header
@@ -6585,7 +6598,7 @@ def get_plan_renderer_js():
 
                 // Battery temperature
                 if (jsonData.degradation_enable) {
-                    html += `<td id=batt_temp bgcolor=#FFFFFF>${row.battery_temp || '—'}°</td>`;
+                    html += `<td id=batt_temp bgcolor=#FFFFFF>${row.battery_temp || '-'}°</td>`;
                 }
 
                 // Cost change
@@ -6714,11 +6727,13 @@ def get_plan_renderer_js():
             }
 
             html += '</table>';
+            if (showDegrad) { html += '</div>'; }  // close LEFT (active) column
 
             // Phase 2: Degradation-aware plan comparison table
             if (jsonData.degrad_rows && jsonData.degrad_rows.length > 0) {
                 const degradRows = jsonData.degrad_rows;
                 const degradTotals = jsonData.degrad_totals || {};
+                html += '<div>' + rightCap;  // open RIGHT (comparison) column
                 // State spans 2 columns (matching the main plan table).  Mirror the main
                 // table's per-cell padding (cellStyle = "padding: 4px") so the degrad rows
                 // are exactly the same height and the two tables line up to the bottom.
@@ -6728,8 +6743,9 @@ def get_plan_renderer_js():
                 // plan table).  In-effect status is shown only by the header background tint
                 // (green when controlling the battery, blue when comparison only) so no
                 // extra text widens the columns.
-                const inEffect = jsonData.degrad_in_effect;
-                const hdrBg = inEffect ? '#c8e6c9' : '#e3f2fd';
+                // RIGHT table is always the comparison (non-executing) plan, so it
+                // carries the blue "comparison" tint; the ACTIVE plan is the left table.
+                const hdrBg = '#e3f2fd';
                 // Header row (single row, aligns with the main plan table header)
                 html += '<tr>';
                 html += '<th style="background:' + hdrBg + '" colspan=2><b>State</b></th>';
@@ -6818,6 +6834,7 @@ def get_plan_renderer_js():
                 html += '<td' + dcs + ' bgcolor=#FFFFFF><b>' + (Math.abs(degradTotals.total_cost||0) >= 0.005 ? totalCostStr : '') + '</b></td>';
                 html += '</tr>';
                 html += '</table>';
+                html += '</div>';  // close RIGHT (comparison) column
             }
 
             html += '</div>';
