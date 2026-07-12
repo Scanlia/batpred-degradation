@@ -2476,4 +2476,5 @@ APPS_SCHEMA = {
     "degradation_cost_enable": {"type": "boolean"},
     "degradation_cost_weight": {"type": "float"},
     "degradation_jit_charge": {"type": "boolean"},
+    "degradation_calibration_factor": {"type": "float"},
 }

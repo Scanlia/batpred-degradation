@@ -222,6 +222,11 @@ class DegradationModel:
         self.calendar_life_years = calendar_life_years
         self.eol_capacity_fade = eol_capacity_fade
         self.average_dod = average_dod
+        # Stage-3 age recalibration: a scalar that scales ALL wear cost, meant to be
+        # (re)set periodically from the BMS state-of-health drift vs the model's expected
+        # fade (see expected_fade_fraction).  1.0 = model as-anchored.  Plan-independent, so
+        # it adjusts the absolute wear magnitude without changing which plan is chosen.
+        self.calibration_factor = 1.0
         # Calendar SoC-stress steepness in f_cal = 1 + exp(k*(SoC-0.8)).  Lowered from
         # 5 to 3.5 per literature review: LFP calendar aging is fairly FLAT across SoC
         # (Schimpe plateaus), so steepness 5 (~12x from 50->100%) over-penalised high SoC.
@@ -502,7 +507,27 @@ class DegradationModel:
         double-count that arises from applying a one-way LCOS to two-way throughput.
         """
         denom = self.lifetime_cycles * 2.0 * self.battery_capacity_kwh
-        return self.capex / denom if denom > 0 else 0.0
+        return (self.capex / denom) * self.calibration_factor if denom > 0 else 0.0
+
+    def expected_fade_fraction(self, throughput_two_way_kwh, days_elapsed, avg_temp_c=25.0, avg_soc_percent=50.0):
+        """Model's expected cumulative capacity fade (fraction) for a battery that has
+        moved `throughput_two_way_kwh` of two-way throughput over `days_elapsed` days at
+        roughly the given average temperature and SoC.  Used by the Stage-3 recalibration
+        to compare against the BMS state-of-health and derive `calibration_factor`.
+
+        cycle fade  = eol_fade * (one-way throughput / rated one-way throughput)
+        calendar fade = eol_fade * (days / (calendar_life_years*365)) * arrhenius * soc-stress
+        """
+        one_way = max(throughput_two_way_kwh, 0.0) / 2.0
+        rated_one_way = self.lifetime_cycles * self.battery_capacity_kwh
+        cyc = self.eol_capacity_fade * (one_way / rated_one_way) if rated_one_way > 0 else 0.0
+        cal = 0.0
+        if self.calendar_life_years > 0:
+            T_ref = 298.15
+            arr = math.exp(-self.Ea_cal / (self.R * (avg_temp_c + 273.15))) / math.exp(-self.Ea_cal / (self.R * T_ref))
+            fcal = self.calendar_soc_stress(avg_soc_percent / 100.0)
+            cal = self.eol_capacity_fade * (days_elapsed / (self.calendar_life_years * 365.0)) * arr * fcal
+        return cyc + cal
 
     def cycle_cost_cents(self, temp_c, soc_percent, delta_throughput_kwh, delta_time_hours, is_charging):
         """Absolute cycle-wear cost (cents) for this step's throughput.
@@ -539,7 +564,7 @@ class DegradationModel:
         fcal = self.calendar_soc_stress(soc_percent / 100.0)
         stress = (fcal - 1.0) if marginal else fcal
         nominal_cents_per_hour = self.capex / (self.calendar_life_years * 8760.0)
-        return nominal_cents_per_hour * arrhenius * stress * delta_time_hours
+        return nominal_cents_per_hour * arrhenius * stress * delta_time_hours * self.calibration_factor
 
     def step_wear_cost_cents(self, temp_c, soc_percent, delta_throughput_kwh, delta_time_hours, is_charging, calendar_marginal=True):
         """Total physical wear cost (cents) for one step: cycle + calendar.
