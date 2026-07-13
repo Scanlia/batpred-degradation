@@ -584,8 +584,11 @@ class Output:
             html += "<th><b>Batt °C</b></th>"
         html += "<th><b>Cost</b></th>"
         if getattr(self, "degradation_enable", False):
-            html += "<th><b>Wear x</b></th>"
-            html += "<th><b>C</b></th>"
+            if plan_debug:
+                html += "<th><b>Wear x</b></th>"
+                html += "<th><b>C</b></th>"
+                html += "<th><b>Cyc c</b></th>"
+                html += "<th><b>Cal c</b></th>"
             html += "<th><b>Wear c</b></th>"
         html += "<th><b>Total</b></th>"
         if self.carbon_enable:
@@ -1300,6 +1303,8 @@ class Output:
             wear_x = 0.0
             wear_c = 0.0
             wear_c_rate = 0.0
+            cyc_c = 0.0
+            cal_c = 0.0
             battery_temp = 0.0
             mid_soc = soc_percent - (soc_change / self.soc_max * 100.0 / 2.0)
             is_chg = soc_change > 0
@@ -1337,14 +1342,18 @@ class Output:
                 # the displayed wear matches what the planner actually optimises.
                 dt_hours = (minute_end - minute_start) / 60.0
                 if abs(soc_change) > 0.01:
-                    wear_c = self.degradation_model.cycle_cost_cents(
+                    cyc_c = self.degradation_model.cycle_cost_cents(
                         temp_c=temp_c, soc_percent=mid_soc,
                         delta_throughput_kwh=abs(soc_change), delta_time_hours=dt_hours, is_charging=is_chg,
                     )
-                calendar_cost = self.degradation_model.calendar_cost_cents(
+                cal_c = self.degradation_model.calendar_cost_cents(
                     temp_c=temp_c, soc_percent=mid_soc, delta_time_hours=dt_hours, marginal=True,
                 )
-                wear_c = round(wear_c + calendar_cost, 2)
+                # cyc_c = cycle-throughput wear, cal_c = marginal calendar (SoC-dwell) wear.
+                # Rolled into wear_c for the default view; shown split under Show Debug.
+                cyc_c = round(cyc_c, 2)
+                cal_c = round(cal_c, 2)
+                wear_c = round(cyc_c + cal_c, 2)
 
                 degrad_wear_c_total += wear_c
                 degrad_wear_x_weighted += abs(soc_change) * wear_x
@@ -1731,24 +1740,27 @@ class Output:
                 html += "<td id=batt_temp bgcolor=#FFFFFF>" + str(battery_temp) + "°</td>"
             html += "<td id=cost bgcolor=" + cost_color + ">" + str(cost_str) + "</td>"
             if getattr(self, "degradation_enable", False):
-                if wear_x > 0:
-                    if wear_x < 0.8:
-                        wear_x_color = "#E8F5E9"
-                    elif wear_x < 1.2:
-                        wear_x_color = "#FFFFFF"
-                    elif wear_x < 2.0:
-                        wear_x_color = "#FFF8E1"
-                    elif wear_x < 3.0:
-                        wear_x_color = "#FFCDD2"
+                if plan_debug:
+                    if wear_x > 0:
+                        if wear_x < 0.8:
+                            wear_x_color = "#E8F5E9"
+                        elif wear_x < 1.2:
+                            wear_x_color = "#FFFFFF"
+                        elif wear_x < 2.0:
+                            wear_x_color = "#FFF8E1"
+                        elif wear_x < 3.0:
+                            wear_x_color = "#FFCDD2"
+                        else:
+                            wear_x_color = "#EF5350"
+                        html += "<td id=wear_x bgcolor=" + wear_x_color + ">x{:.2f}</td>".format(wear_x)
                     else:
-                        wear_x_color = "#EF5350"
-                    html += "<td id=wear_x bgcolor=" + wear_x_color + ">x{:.2f}</td>".format(wear_x)
-                else:
-                    html += "<td id=wear_x bgcolor=#FFFFFF>-</td>"
-                if wear_c_rate > 0:
-                    html += "<td id=wear_crate bgcolor=#FFFFFF>{:.2f}C</td>".format(wear_c_rate)
-                else:
-                    html += "<td id=wear_crate bgcolor=#FFFFFF>-</td>"
+                        html += "<td id=wear_x bgcolor=#FFFFFF>-</td>"
+                    if wear_c_rate > 0:
+                        html += "<td id=wear_crate bgcolor=#FFFFFF>{:.2f}C</td>".format(wear_c_rate)
+                    else:
+                        html += "<td id=wear_crate bgcolor=#FFFFFF>-</td>"
+                    html += "<td id=cyc_c bgcolor=#FFFFFF>" + ("{:.2f}c".format(cyc_c) if cyc_c > 0 else "-") + "</td>"
+                    html += "<td id=cal_c bgcolor=#FFFFFF>" + ("{:.2f}c".format(cal_c) if cal_c > 0 else "-") + "</td>"
                 if wear_c < 0.5:
                     wc_color = "#FFFFFF"
                 elif wear_c < 5:
@@ -1857,6 +1869,8 @@ class Output:
                 json_row["wear_x"] = float("{:.2f}".format(wear_x))
                 json_row["wear_c"] = float("{:.2f}".format(wear_c))
                 json_row["wear_c_rate"] = float("{:.2f}".format(wear_c_rate))
+                json_row["cyc_c"] = float("{:.2f}".format(cyc_c))
+                json_row["cal_c"] = float("{:.2f}".format(cal_c))
             # Add rowspan hints for client-side rendering
             json_row["rowspan_state"] = rowspan if start_span else 0
             json_row["skip_state_cell"] = in_span and not start_span
@@ -1890,12 +1904,15 @@ class Output:
         html += "<td bgcolor=#FFFFFF><b>" + str(soc_percent_end) + "</b></td>"
         html += "<td></td>"  # Soc change
         if getattr(self, "degradation_enable", False):
-            if degrad_throughput_total > 0:
-                avg_wear_x = round(degrad_wear_x_weighted / degrad_throughput_total, 2)
-            else:
-                avg_wear_x = 0.0
-            html += "<td bgcolor=#FFFFFF><b>x{:.2f}</b></td>".format(avg_wear_x)
-            html += "<td bgcolor=#FFFFFF></td>"
+            if getattr(self, "plan_debug", False):
+                if degrad_throughput_total > 0:
+                    avg_wear_x = round(degrad_wear_x_weighted / degrad_throughput_total, 2)
+                else:
+                    avg_wear_x = 0.0
+                html += "<td bgcolor=#FFFFFF><b>x{:.2f}</b></td>".format(avg_wear_x)
+                html += "<td bgcolor=#FFFFFF></td>"  # C
+                html += "<td bgcolor=#FFFFFF></td>"  # Cyc c
+                html += "<td bgcolor=#FFFFFF></td>"  # Cal c
             html += "<td bgcolor=#FFFFFF><b>{:.1f}c</b></td>".format(round(degrad_wear_c_total, 1))
         html += "<td bgcolor=#FFFFFF><b>" + str(total_str) + "</b></td>"
         if self.carbon_enable:
