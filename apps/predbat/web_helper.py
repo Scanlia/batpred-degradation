@@ -6418,8 +6418,12 @@ def get_plan_renderer_js():
             }
             html += '<th><b>Cost</b></th>';
             if (jsonData.degradation_enable) {
-                html += '<th><b>Wear x</b></th>';
-                html += '<th><b>C</b></th>';
+                if (showDebug) {
+                    html += '<th><b>Wear x</b></th>';
+                    html += '<th><b>C</b></th>';
+                    html += '<th><b>Cyc c</b></th>';
+                    html += '<th><b>Cal c</b></th>';
+                }
                 html += '<th><b>Wear c</b></th>';
             }
             html += '<th><b>Total</b></th>';
@@ -6569,28 +6573,35 @@ def get_plan_renderer_js():
                 }
                 html += `<td id=cost bgcolor=${row.cost_color || '#FFFFFF'}>${costStr}</td>`;
 
-                // Wear x (condition-only multiplier, no C-rate)
+                // Wear columns (multiplier/C-rate/split shown only under Show Debug)
                 if (jsonData.degradation_enable) {
-                    const wx = row.wear_x;
-                    if (wx !== undefined && wx > 0) {
-                        let wearColor = '#FFFFFF';
-                        if (wx < 0.8) wearColor = '#E8F5E9';
-                        else if (wx < 1.2) wearColor = '#FFFFFF';
-                        else if (wx < 2.0) wearColor = '#FFF8E1';
-                        else if (wx < 3.0) wearColor = '#FFCDD2';
-                        else wearColor = '#EF5350';
-                        html += `<td id=wear_x bgcolor=${wearColor}>x${wx.toFixed(2)}</td>`;
-                    } else {
-                        html += '<td id=wear_x bgcolor=#FFFFFF>-</td>';
+                    if (showDebug) {
+                        const wx = row.wear_x;
+                        if (wx !== undefined && wx > 0) {
+                            let wearColor = '#FFFFFF';
+                            if (wx < 0.8) wearColor = '#E8F5E9';
+                            else if (wx < 1.2) wearColor = '#FFFFFF';
+                            else if (wx < 2.0) wearColor = '#FFF8E1';
+                            else if (wx < 3.0) wearColor = '#FFCDD2';
+                            else wearColor = '#EF5350';
+                            html += `<td id=wear_x bgcolor=${wearColor}>x${wx.toFixed(2)}</td>`;
+                        } else {
+                            html += '<td id=wear_x bgcolor=#FFFFFF>-</td>';
+                        }
+                        // C-rate for the 30-min slot
+                        const cRate = row.wear_c_rate;
+                        if (cRate !== undefined && cRate > 0) {
+                            html += `<td id=wear_crate bgcolor=#FFFFFF>${cRate.toFixed(2)}C</td>`;
+                        } else {
+                            html += '<td id=wear_crate bgcolor=#FFFFFF>-</td>';
+                        }
+                        // Cyc c (throughput wear) and Cal c (calendar/SoC-dwell wear)
+                        const cyc = row.cyc_c;
+                        const cal = row.cal_c;
+                        html += `<td id=cyc_c bgcolor=#FFFFFF>${(cyc !== undefined && cyc > 0) ? cyc.toFixed(2) + 'c' : '-'}</td>`;
+                        html += `<td id=cal_c bgcolor=#FFFFFF>${(cal !== undefined && cal > 0) ? cal.toFixed(2) + 'c' : '-'}</td>`;
                     }
-                    // C-rate for the 30-min slot
-                    const cRate = row.wear_c_rate;
-                    if (cRate !== undefined && cRate > 0) {
-                        html += `<td id=wear_crate bgcolor=#FFFFFF>${cRate.toFixed(2)}C</td>`;
-                    } else {
-                        html += '<td id=wear_crate bgcolor=#FFFFFF>-</td>';
-                    }
-                    // Wear c (cycle + calendar cost in cents)
+                    // Wear c (cycle + calendar cost in cents) - always shown
                     const wc = row.wear_c;
                     let wcColor = '#FFFFFF';
                     if (wc >= 20) wcColor = '#FFCDD2';
@@ -6660,10 +6671,14 @@ def get_plan_renderer_js():
 
                 // Wear x average + wear c total
                 if (jsonData.degradation_enable) {
-                    const wxAvg = totals.wear_x_avg !== undefined ? totals.wear_x_avg : 0;
                     const wcTotal = totals.wear_c_total !== undefined ? totals.wear_c_total : 0;
-                    html += `<td bgcolor=#FFFFFF><b>x${wxAvg.toFixed(2)}</b></td>`;
-                    html += '<td bgcolor=#FFFFFF></td>';
+                    if (showDebug) {
+                        const wxAvg = totals.wear_x_avg !== undefined ? totals.wear_x_avg : 0;
+                        html += `<td bgcolor=#FFFFFF><b>x${wxAvg.toFixed(2)}</b></td>`;
+                        html += '<td bgcolor=#FFFFFF></td>';  // C
+                        html += '<td bgcolor=#FFFFFF></td>';  // Cyc c
+                        html += '<td bgcolor=#FFFFFF></td>';  // Cal c
+                    }
                     html += `<td bgcolor=#FFFFFF><b>${wcTotal.toFixed(1)}c</b></td>`;
                 }
 
@@ -6708,8 +6723,12 @@ def get_plan_renderer_js():
                 html += '<th style="background:' + hdrBg + '"><b>Limit %</b></th>';
                 html += '<th style="background:' + hdrBg + '"><b>SoC %</b></th>';
                 html += '<th style="background:' + hdrBg + '"><b>Cost</b></th>';
-                html += '<th style="background:' + hdrBg + '"><b>Wear x</b></th>';
-                html += '<th style="background:' + hdrBg + '"><b>C</b></th>';
+                if (showDebug) {
+                    html += '<th style="background:' + hdrBg + '"><b>Wear x</b></th>';
+                    html += '<th style="background:' + hdrBg + '"><b>C</b></th>';
+                    html += '<th style="background:' + hdrBg + '"><b>Cyc c</b></th>';
+                    html += '<th style="background:' + hdrBg + '"><b>Cal c</b></th>';
+                }
                 html += '<th style="background:' + hdrBg + '"><b>Wear c</b></th>';
                 html += '<th style="background:' + hdrBg + '"><b>Total</b></th>';
                 html += '</tr>';
@@ -6744,22 +6763,29 @@ def get_plan_renderer_js():
                     if (cost >= 0.005) costStr = '+' + Math.round(cost*100) + 'c &nearr;';
                     else if (cost <= -0.005) costStr = '-' + Math.round(Math.abs(cost)*100) + 'c &searr;';
                     html += '<td' + dcs + ' bgcolor=' + (row.cost_color || '#FFFFFF') + '>' + costStr + '</td>';
-                    // Wear x
-                    const wx = row.wear_x;
-                    if (wx !== undefined && wx > 0) {
-                        let wColor = '#FFFFFF';
-                        if (wx < 0.8) wColor = '#E8F5E9';
-                        else if (wx < 1.2) wColor = '#FFFFFF';
-                        else if (wx < 2.0) wColor = '#FFF8E1';
-                        else if (wx < 3.0) wColor = '#FFCDD2';
-                        else wColor = '#EF5350';
-                        html += '<td' + dcs + ' bgcolor=' + wColor + '>x' + wx.toFixed(2) + '</td>';
-                    } else {
-                        html += '<td' + dcs + ' bgcolor=#FFFFFF>-</td>';
+                    if (showDebug) {
+                        // Wear x
+                        const wx = row.wear_x;
+                        if (wx !== undefined && wx > 0) {
+                            let wColor = '#FFFFFF';
+                            if (wx < 0.8) wColor = '#E8F5E9';
+                            else if (wx < 1.2) wColor = '#FFFFFF';
+                            else if (wx < 2.0) wColor = '#FFF8E1';
+                            else if (wx < 3.0) wColor = '#FFCDD2';
+                            else wColor = '#EF5350';
+                            html += '<td' + dcs + ' bgcolor=' + wColor + '>x' + wx.toFixed(2) + '</td>';
+                        } else {
+                            html += '<td' + dcs + ' bgcolor=#FFFFFF>-</td>';
+                        }
+                        // C-rate
+                        const cRate = row.wear_c_rate;
+                        html += '<td' + dcs + ' bgcolor=#FFFFFF>' + (cRate > 0 ? cRate.toFixed(2) + 'C' : '-') + '</td>';
+                        // Cyc c + Cal c split
+                        const cyc = row.cyc_c;
+                        const cal = row.cal_c;
+                        html += '<td' + dcs + ' bgcolor=#FFFFFF>' + ((cyc !== undefined && cyc > 0) ? cyc.toFixed(2) + 'c' : '-') + '</td>';
+                        html += '<td' + dcs + ' bgcolor=#FFFFFF>' + ((cal !== undefined && cal > 0) ? cal.toFixed(2) + 'c' : '-') + '</td>';
                     }
-                    // C-rate
-                    const cRate = row.wear_c_rate;
-                    html += '<td' + dcs + ' bgcolor=#FFFFFF>' + (cRate > 0 ? cRate.toFixed(2) + 'C' : '-') + '</td>';
                     // Wear c
                     const wc = row.wear_c;
                     let wcColor = '#FFFFFF';
@@ -6779,10 +6805,14 @@ def get_plan_renderer_js():
                 // Totals row: State(2), Limit %, SoC %, Cost (all blank), Wear x, C, Wear c, Total
                 html += '<tr style="color:black">';
                 html += '<td colspan=2' + dcs + '></td><td' + dcs + '></td><td' + dcs + '></td><td' + dcs + '></td>';
-                const wxAvg = degradTotals.wear_x_avg !== undefined ? degradTotals.wear_x_avg : 0;
                 const wcTotal = degradTotals.wear_c_total !== undefined ? degradTotals.wear_c_total : 0;
-                html += '<td' + dcs + ' bgcolor=#FFFFFF><b>x' + wxAvg.toFixed(2) + '</b></td>';
-                html += '<td' + dcs + ' bgcolor=#FFFFFF></td>';
+                if (showDebug) {
+                    const wxAvg = degradTotals.wear_x_avg !== undefined ? degradTotals.wear_x_avg : 0;
+                    html += '<td' + dcs + ' bgcolor=#FFFFFF><b>x' + wxAvg.toFixed(2) + '</b></td>';
+                    html += '<td' + dcs + ' bgcolor=#FFFFFF></td>';  // C
+                    html += '<td' + dcs + ' bgcolor=#FFFFFF></td>';  // Cyc c
+                    html += '<td' + dcs + ' bgcolor=#FFFFFF></td>';  // Cal c
+                }
                 html += '<td' + dcs + ' bgcolor=#FFFFFF><b>' + wcTotal.toFixed(1) + 'c</b></td>';
                 const totalCostStr = degradTotals.total_cost >= 0 ?
                     '' + jsonData.currency_symbols[0] + (degradTotals.total_cost||0).toFixed(2) :
