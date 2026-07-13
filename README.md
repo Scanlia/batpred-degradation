@@ -81,11 +81,11 @@ observed real-world fade without changing the physics.
 
 Because the calendar term pushes state of charge **down** when the battery is idle, pair it with:
 
-* **`combine_charge_slots: true`** — with fine per-slot charge windows the optimiser can manufacture a
+* **`combine_charge_slots: true`**. With fine per-slot charge windows the optimiser can manufacture a
   wasteful overnight **charge/discharge sawtooth** (topping up and bleeding down around one SoC).
   Combined windows set one target per low-rate block and let it hold flat instead. `set_charge_low_power`
   keeps the combined charge gentle, so you don't lose slow charging.
-* **`metric_battery_value_scaling` near 1.0** — this values charge still in the battery at the end of the
+* **`metric_battery_value_scaling` near 1.0**. This values charge still in the battery at the end of the
   planning horizon. Keeping it close to 1.0 stops the calendar term from over-dumping the pack just
   because the plan window ends.
 
