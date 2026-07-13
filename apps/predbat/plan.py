@@ -4066,7 +4066,7 @@ class Plan:
 
             if self.calculate_regions:
                 region_size = int(16 * 60)
-                min_region_size = int(120)
+                min_region_size = int(self.args.get("calculate_min_region_size", 120))
                 while region_size >= min_region_size:
                     self.log(">> Region optimisation pass width {}".format(region_size))
                     # step_size = int(max(region_size / 2, min_region_size))
