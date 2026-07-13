@@ -169,7 +169,7 @@ class DegradationModel:
     optimiser's decisions.
     """
 
-    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=10000, nominal_c_rate=None, calendar_life_years=15.0, eol_capacity_fade=0.30, average_dod=1.0, expected_cycles_per_year=365.0, calendar_soc_a_max=2.5, calendar_soc_mid=0.78, calendar_soc_k=12.0):
+    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=10000, nominal_c_rate=None, calendar_life_years=15.0, eol_capacity_fade=0.30, average_dod=1.0, expected_cycles_per_year=365.0, calendar_soc_a_max=2.0, calendar_soc_mid=0.72, calendar_soc_k=10.0):
         """Initialise the degradation model.
 
         Args:
@@ -458,11 +458,14 @@ class DegradationModel:
 
             f_cal(SoC) = 1 + A_max / (1 + exp(-k*(SoC - mid)))
 
-        Flat/benign across low-mid SoC, rising to a PLATEAU near full charge (SEI growth +
-        Fe dissolution above ~80%).  Unlike the old 1+exp(k*(SoC-0.8)), this SATURATES at
-        1+A_max so the marginal term (f-1) can never exceed A_max (~2.5) x the baseline rate,
-        matching the measured flat/plateaued LFP calendar-vs-SoC shape (Naumann/Schimpe) and
-        keeping the optimiser's marginal cost numerically stable at SoC->100%.
+        The true mechanism (Schimpe Tafel form) is voltage-driven via the graphite anode
+        OCV Ua(SoC), accelerating toward high SoC and saturating near 100% as Ua bottoms out.
+        This logistic approximates that shape and SATURATES at 1+A_max.  Anchored to a direct
+        measurement on the SAME Sony/Murata LFP cell as our other coefficients: ~3.0x fade
+        fold-change 20%->100% SoC (35C/30mo) -> A_max=2.0 (1+A_max=3.0); low-anode-potential
+        onset ~70% (Schmalstieg/Kaebitz) -> mid=0.72.  k (~8-12) is not empirically pinned
+        (no interior SoC point found) and is left tunable.  Replaces the old unbounded
+        1+exp(5*(SoC-0.8)) which implied a ~12x ratio (4x too steep vs measured).
         """
         s = min(max(soc_decimal, 0.0), 1.0)
         return 1.0 + self.calendar_soc_a_max / (1.0 + math.exp(-self.calendar_soc_k * (s - self.calendar_soc_mid)))
