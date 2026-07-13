@@ -2477,4 +2477,7 @@ APPS_SCHEMA = {
     "degradation_cost_weight": {"type": "float"},
     "degradation_jit_charge": {"type": "boolean"},
     "degradation_calibration_factor": {"type": "float"},
+    "degradation_calendar_contamination": {"type": "float"},
+    "degradation_marginal_baseline_soc": {"type": "float"},
+    "degradation_chemistry": {"type": "string"},
 }

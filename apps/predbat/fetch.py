@@ -2461,18 +2461,33 @@ class Fetch:
         self.metric_min_improvement_plan = self.get_arg("metric_min_improvement_plan")
         self.metric_min_improvement_export_freeze = self.get_arg("metric_min_improvement_export_freeze")
         self.metric_battery_cycle = self.get_arg("metric_battery_cycle")
-        if self.args.get("degradation_enable", False):
+        if self.get_arg("degradation_enable", False):
             self.degradation_enable = True
             if not self.degradation_model:
                 self.degradation_model = DegradationModel(
                     chemistry=self.get_arg("degradation_chemistry", "LFP"),
                     battery_capacity_kwh=self.get_arg("degradation_battery_capacity", 24.0),
                     capex=self.get_arg("degradation_capex", 1000000),
-                    lifetime_cycles=self.get_arg("degradation_lifetime_cycles", 8000),
+                    lifetime_cycles=self.get_arg("degradation_lifetime_cycles", 10000),
                     nominal_c_rate=self.get_arg("degradation_nominal_c_rate", 0),
+                    calendar_life_years=self.get_arg("degradation_calendar_life_years", 15.0),
+                    eol_capacity_fade=self.get_arg("degradation_eol_capacity_fade", 0.30),
+                    calendar_contamination=self.get_arg("degradation_calendar_contamination", 0.82),
+                    marginal_baseline_soc=self.get_arg("degradation_marginal_baseline_soc", 0.10),
                 )
-                self.log("Degradation model enabled: chemistry={}, baseline_cost={:.4f} c/kWh".format(
-                    self.degradation_model.chemistry, getattr(self, "metric_battery_cycle", self.degradation_model.baseline_cycle_cost())))
+            # Refresh tunable params every config cycle so apps.yaml edits (calibration,
+            # baseline SoC, calendar life, ...) apply on reload, not only on a full restart.
+            self.degradation_model.apply_config(
+                battery_capacity_kwh=self.get_arg("degradation_battery_capacity", 24.0),
+                capex=self.get_arg("degradation_capex", 1000000),
+                lifetime_cycles=self.get_arg("degradation_lifetime_cycles", 10000),
+                nominal_c_rate=self.get_arg("degradation_nominal_c_rate", 0),
+                calendar_life_years=self.get_arg("degradation_calendar_life_years", 15.0),
+                eol_capacity_fade=self.get_arg("degradation_eol_capacity_fade", 0.30),
+                calendar_contamination=self.get_arg("degradation_calendar_contamination", 0.82),
+                marginal_baseline_soc=self.get_arg("degradation_marginal_baseline_soc", 0.10),
+                calibration_factor=self.get_arg("degradation_calibration_factor", 1.0),
+            )
         else:
             self.degradation_enable = False
             self.degradation_model = None
