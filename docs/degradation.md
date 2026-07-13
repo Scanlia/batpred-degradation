@@ -12,7 +12,7 @@ optimiser trade money against genuine degradation.
 ## The two mechanisms
 
 The model in `apps/predbat/degradation.py` prices each mechanism at its **own nameplate cost** and
-**adds them** — there is no capex apportionment splitting one budget between them. Over the life of the
+**adds them**. There is no capex apportionment splitting one budget between them. Over the life of the
 pack the two contributions sum to roughly one capex worth of fade.
 
 ### Cycle wear
@@ -74,10 +74,10 @@ Set these in `apps.yaml`:
 | `degradation_battery_capacity` | Usable capacity, kWh | your pack |
 | `degradation_lifetime_cycles` | Rated full cycles to end-of-life | e.g. `10000` |
 | `degradation_nominal_c_rate` | Reference C-rate for the cycle multiplier | e.g. `0.2` |
-| `degradation_calendar_life_years` | Rated calendar life (LFP is calendar-robust) | `15`–`20` |
+| `degradation_calendar_life_years` | Rated calendar life (LFP is calendar-robust) | `15` to `20` |
 | `degradation_eol_capacity_fade` | Fade defining end of life (e.g. 0.30 = 70% retention) | `0.30` |
 | `degradation_calendar_contamination` | Shared-budget factor on cycle cost | `0.82` |
-| `degradation_marginal_baseline_soc` | SoC below which calendar is not priced in scoring | `0.10`–`0.30` |
+| `degradation_marginal_baseline_soc` | SoC below which calendar is not priced in scoring | `0.10` to `0.30` |
 | `degradation_calibration_factor` | Global scale on the whole model | tune to fade |
 | `degradation_jit_charge` | Defer charging to reduce high-SoC dwell (validate first) | `false` |
 
@@ -87,7 +87,7 @@ Because the calendar term pushes SoC **down** when the battery is idle, two nati
 matter:
 
 * **`combine_charge_slots: true`.** With fine per-slot charge windows the optimiser can manufacture a
-  wasteful overnight **charge/discharge sawtooth** — repeatedly topping the pack up and bleeding it down
+  wasteful overnight **charge/discharge sawtooth**, repeatedly topping the pack up and bleeding it down
   around a single SoC to hold charge for a later peak. Each such cycle loses round-trip efficiency plus
   wear for no net storage. Combined windows set one charge target per low-rate block, so the plan holds
   flat (or charges once, just-in-time before the peak) instead. `set_charge_low_power` keeps the combined
