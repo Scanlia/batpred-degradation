@@ -29,41 +29,69 @@ If you find Home Assistant and Predbat too difficult to set up yourself, there i
 ## 🔋 Degradation fork additions
 
 Standard Predbat prices battery use with a single flat `metric_battery_cycle` cost per kWh of
-throughput, so every cycle costs the same regardless of charge rate or temperature. Real LFP batteries
-don't wear like that: **high C-rate and extreme temperatures accelerate degradation**. This fork models
-that and lets the planner exploit it.
+throughput, so every cycle costs the same regardless of charge rate, temperature, or how long the pack
+sits at high state of charge. Real LFP batteries don't wear like that. This fork replaces the flat cost
+with a **physics-based wear model** that prices the two real ageing mechanisms separately, and lets the
+planner trade money against genuine degradation. See [Degradation model](docs/degradation.md) for the
+full detail; the summary is below.
 
-The fork compares two plans and picks the cheaper on total cost:
+The fork optimises and compares two plans, then picks the cheaper on **total cost (money + modelled
+wear)**:
 
-* the **standard plan** (upstream behaviour: full charge rate, money-optimal), and
-* the **degradation-aware plan** (gentle, low-power charging that reduces C-rate wear).
+* the **comparison plan** (upstream-style: money plus a flat cycle cost), and
+* the **degradation-aware ACTIVE plan** (money plus real, mechanism-based wear).
 
-What it adds on top of upstream Predbat:
+### Two ageing mechanisms, priced independently
 
-* **Physics-based wear model** (`apps/predbat/degradation.py`): a per-step degradation multiplier `μ`
-  driven by **charge/discharge C-rate** and **battery temperature**, calibrated to the cell's rated
-  cycle life (LCOS ≈ capex / (capacity · cycles · depth-of-discharge)). Gentle charging at mild
-  temperatures wears the pack far less than a hard, cold fast-charge.
-* **True economic objective**: plans are scored on `J = money (import minus export) + real μ-weighted
-  wear` instead of money plus a flat cycle cost. Wear is priced at its actual modelled cost, so the
-  optimiser will spend a fraction of a cent of energy to avoid a larger chunk of battery wear (and
-  vice versa).
-* **Automatic low-power (gentle) charging, executed live.** Every ~30 min the fork optimises the plan at
-  **full charge rate** and at **low (spread) charge rate**, scores both on `J`, and automatically toggles
-  Predbat's native `set_charge_low_power` for the live plan **only when gentle charging clearly lowers
-  total cost** (a deadband prevents flapping). This reuses Predbat's own battle-tested charge-rate
-  dispatch, so what runs is exactly what was scored, and never worse than the standard plan.
-* **Side-by-side comparison UI**: the plan page shows the **ACTIVE** (executing) plan next to the
-  **comparison** plan, with extra `Wear x` / `Wear c` columns, so you can see the money vs degradation
-  trade-off the optimiser is making at a glance.
+The model (`apps/predbat/degradation.py`) prices each mechanism at its own nameplate cost and **adds
+them** (no capex apportionment between them):
+
+* **Cycle wear** scales with **energy throughput**, **charge/discharge C-rate**, and **temperature**.
+  Gentle, warm charging wears the pack far less than a hard, cold fast-charge. Base cost is
+  `capex / (lifetime_cycles · 2 · capacity)`, then a per-step multiplier for C-rate and temperature.
+* **Calendar ageing** scales with **state of charge**, **temperature (Arrhenius)**, and **time held**.
+  Base rate is `capex / (calendar_life_years · 8760 h)`, multiplied by an SoC-stress factor from a
+  literature-validated 9-point table (Schimpe 2018 / Safari 2011): stress is **lowest near empty and
+  rises steeply toward full**, so the planner naturally parks the battery low when idle. A
+  `calendar_contamination` factor (~0.82) keeps the two mechanisms sharing one end-of-life fade budget
+  rather than double-counting it.
+
+A single `degradation_calibration_factor` scales the whole model so you can tune its aggressiveness to
+observed real-world fade without changing the physics.
+
+### What it adds on top of upstream Predbat
+
+* **True economic objective**: plans are scored on `J = money (import minus export) + real wear`
+  instead of money plus a flat cycle cost, so the optimiser will spend a fraction of a cent of energy to
+  avoid a larger chunk of battery wear (and vice versa).
+* **Automatic low-power (gentle) charging, executed live.** Every ~30 min the fork optimises at **full
+  charge rate** and at **low (spread) charge rate**, scores both on `J`, and toggles Predbat's native
+  `set_charge_low_power` for the live plan **only when gentle charging clearly lowers total cost** (a
+  deadband prevents flapping). This reuses Predbat's own charge-rate dispatch, so what runs is exactly
+  what was scored, and never worse than the standard plan.
+* **Side-by-side comparison UI**: the plan page shows the **ACTIVE** plan next to the **comparison**
+  plan, with a `Wear c` column (and `Wear x` / `C-rate` / `Cyc c` / `Cal c` breakdown under **Show
+  Debug**), so you can see the money vs degradation trade-off at a glance.
 * **Degradation audit and forecast logging**: optional helpers snapshot each standard vs low-power pair
   to CSV and log forward energy rates and PV forecasts, for offline what-if analysis and validation.
 * **Reproducible overlay build**: a **digest-pinned** upstream base image with our modified source files
   layered on top, so upstream can be re-based deliberately without the base silently moving under us.
 
-Enable it with the `degradation_enable` / `degradation_compare_enable` options plus your cell's
-`degradation_lifetime_cycles` and `degradation_nominal_c_rate`; leave them off and Predbat behaves
-exactly like upstream.
+### Recommended companion settings
+
+Because the calendar term pushes state of charge **down** when the battery is idle, pair it with:
+
+* **`combine_charge_slots: true`** — with fine per-slot charge windows the optimiser can manufacture a
+  wasteful overnight **charge/discharge sawtooth** (topping up and bleeding down around one SoC).
+  Combined windows set one target per low-rate block and let it hold flat instead. `set_charge_low_power`
+  keeps the combined charge gentle, so you don't lose slow charging.
+* **`metric_battery_value_scaling` near 1.0** — this values charge still in the battery at the end of the
+  planning horizon. Keeping it close to 1.0 stops the calendar term from over-dumping the pack just
+  because the plan window ends.
+
+Enable the model with `degradation_enable` / `degradation_compare_enable` / `degradation_cost_enable`,
+plus your cell's `degradation_lifetime_cycles`, `degradation_calendar_life_years`, and
+`degradation_capex`; leave them off and Predbat behaves exactly like upstream.
 
 > ⚠️ Experimental. This controls a real battery. Start with `degradation_compare_enable` (comparison
 > only, does not touch dispatch), watch the audit pairs, and only then enable execution.
