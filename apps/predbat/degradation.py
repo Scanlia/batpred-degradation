@@ -169,7 +169,7 @@ class DegradationModel:
     optimiser's decisions.
     """
 
-    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=10000, nominal_c_rate=None, calendar_life_years=15.0, eol_capacity_fade=0.30, average_dod=1.0):
+    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=10000, nominal_c_rate=None, calendar_life_years=15.0, eol_capacity_fade=0.30, average_dod=1.0, expected_cycles_per_year=365.0, calendar_soc_a_max=2.5, calendar_soc_mid=0.78, calendar_soc_k=12.0):
         """Initialise the degradation model.
 
         Args:
@@ -227,10 +227,20 @@ class DegradationModel:
         # fade (see expected_fade_fraction).  1.0 = model as-anchored.  Plan-independent, so
         # it adjusts the absolute wear magnitude without changing which plan is chosen.
         self.calibration_factor = 1.0
-        # Calendar SoC-stress steepness in f_cal = 1 + exp(k*(SoC-0.8)).  Lowered from
-        # 5 to 3.5 per literature review: LFP calendar aging is fairly FLAT across SoC
-        # (Schimpe plateaus), so steepness 5 (~12x from 50->100%) over-penalised high SoC.
+        # Calendar SoC-stress shape.  Replaced the UNBOUNDED f_cal = 1 + exp(k*(SoC-0.8))
+        # (whose marginal term (f-1) reached 1-2x the FULL calendar-depreciation rate at high
+        # SoC - physically impossible) with a BOUNDED logistic per the deep-research review:
+        #   f_cal(SoC) = 1 + A_max / (1 + exp(-k*(SoC - mid)))
+        # A_max caps the high/low stress ratio (LFP calendar-vs-SoC is flat/plateaued, not a
+        # runaway exponential); mid centres the transition near the ~80% onset; k sets width.
+        self.calendar_soc_a_max = calendar_soc_a_max
+        self.calendar_soc_mid = calendar_soc_mid
+        self.calendar_soc_k = calendar_soc_k
+        # Legacy exponential steepness (kept for any external caller; unused by the sigmoid).
         self.calendar_soc_steepness = 3.5
+        # Expected real duty (equivalent full cycles/year) used ONLY to apportion the capex
+        # budget between calendar and cycle wear (see _compute_fade_shares).
+        self.expected_cycles_per_year = expected_cycles_per_year
         # Wang 2011: charging/high C-rate REDUCES the effective cycle activation energy
         # (Ea_eff = Ea_cyc - wang_c_rate_coeff * C_rate), a mild WARM C-rate effect, rather
         # than a strong unconditional C^gamma multiplier (Schimpe: ~no warm C-rate effect).
@@ -246,6 +256,40 @@ class DegradationModel:
 
         # Per-step multipliers recorded for the most recent simulation.
         self.step_multipliers = {}  # minute -> multiplier
+
+        # Split the single capex/EOL-fade budget between calendar and cycle wear so their
+        # costs SUM to one capex over life instead of each independently claiming 100%.
+        self._compute_fade_shares()
+
+    def _compute_fade_shares(self):
+        """Apportion the EOL fade budget between calendar and cycle mechanisms.
+
+        Both the calendar anchor (capex/(calendar_life*8760h)) and the cycle anchor
+        (capex/(lifetime_cycles*2*capacity)) are each calibrated to consume the FULL
+        capex/EOL-fade on their own.  Summing them double-counts: at real home duty the
+        naive prediction overshoots the rated EOL fade.  We compute each mechanism's
+        expected annual fade at the real duty and split the budget in that ratio, so the
+        two shares sum to 1 and total predicted fade over life == EOL (see budget check).
+        Shares scale the absolute cost of each mechanism; relative SoC/temp shapes are kept.
+        """
+        cap = max(self.battery_capacity_kwh, 1e-6)
+        # annual cycle fade (fraction of EOL) at expected duty
+        rated_one_way = max(self.lifetime_cycles * cap, 1e-6)
+        annual_one_way = self.expected_cycles_per_year * cap
+        annual_cycle_fade = self.eol_capacity_fade * (annual_one_way / rated_one_way)
+        # annual calendar fade (fraction of EOL) at a typical resting SoC (~50%) and 25C ref
+        typ_soc_stress = self.calendar_soc_stress(0.5)
+        if self.calendar_life_years > 0:
+            annual_calendar_fade = self.eol_capacity_fade * (1.0 / self.calendar_life_years) * typ_soc_stress
+        else:
+            annual_calendar_fade = 0.0
+        total = annual_cycle_fade + annual_calendar_fade
+        if total > 0:
+            self.cycle_fade_share = annual_cycle_fade / total
+            self.calendar_fade_share = annual_calendar_fade / total
+        else:
+            self.cycle_fade_share = 0.5
+            self.calendar_fade_share = 0.5
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -410,14 +454,18 @@ class DegradationModel:
     # ------------------------------------------------------------------
 
     def calendar_soc_stress(self, soc_decimal):
-        """Calendar-ageing SoC stress f(SoC) = 1 + exp(k*(SoC - 0.8)), k=calendar_soc_steepness.
+        """Calendar-ageing SoC stress, BOUNDED logistic (deep-research review):
 
-        Flat/benign across low-mid SoC, rising toward high SoC (SEI growth driven by the
-        elevated graphite-anode potential + Fe dissolution above ~80%).  Steepness reduced
-        to 3.5 per literature (LFP calendar aging is relatively flat vs SoC).  Naumann/Schimpe.
+            f_cal(SoC) = 1 + A_max / (1 + exp(-k*(SoC - mid)))
+
+        Flat/benign across low-mid SoC, rising to a PLATEAU near full charge (SEI growth +
+        Fe dissolution above ~80%).  Unlike the old 1+exp(k*(SoC-0.8)), this SATURATES at
+        1+A_max so the marginal term (f-1) can never exceed A_max (~2.5) x the baseline rate,
+        matching the measured flat/plateaued LFP calendar-vs-SoC shape (Naumann/Schimpe) and
+        keeping the optimiser's marginal cost numerically stable at SoC->100%.
         """
         s = min(max(soc_decimal, 0.0), 1.0)
-        return 1.0 + math.exp(self.calendar_soc_steepness * (s - 0.8))
+        return 1.0 + self.calendar_soc_a_max / (1.0 + math.exp(-self.calendar_soc_k * (s - self.calendar_soc_mid)))
 
     def cycle_soc_stress(self, soc_decimal, is_charging):
         """Cycle-ageing SoC stress (per-direction), from LFP research.
@@ -478,7 +526,10 @@ class DegradationModel:
         """
         temp_k = temp_c + 273.15
         T_ref = 298.15
-        c_rate = max(c_rate, 0.001)
+        # Clamp to a physical band: below ~0 is meaningless, and above ~5C the Wang
+        # Ea-reduction (Ea_eff = Ea_cyc - coeff*C) would drive Ea_eff negative and overflow
+        # math.exp(-Ea_eff/RT).  Real home rates are <1C; 5C is a safe hard cap.
+        c_rate = min(max(c_rate, 0.001), 5.0)
         # Wang 2011: higher C-rate lowers the effective activation energy (mild, warm).
         ea_eff = self.Ea_cyc_normal - self.wang_c_rate_coeff * c_rate
         ea_eff_nom = self.Ea_cyc_normal - self.wang_c_rate_coeff * self.nominal_c_rate
@@ -507,7 +558,9 @@ class DegradationModel:
         double-count that arises from applying a one-way LCOS to two-way throughput.
         """
         denom = self.lifetime_cycles * 2.0 * self.battery_capacity_kwh
-        return (self.capex / denom) * self.calibration_factor if denom > 0 else 0.0
+        # cycle_fade_share apportions the capex so calendar + cycle sum to ONE capex (no
+        # double-count); the cycle mechanism claims only its expected share of the budget.
+        return (self.capex / denom) * self.cycle_fade_share * self.calibration_factor if denom > 0 else 0.0
 
     def expected_fade_fraction(self, throughput_two_way_kwh, days_elapsed, avg_temp_c=25.0, avg_soc_percent=50.0):
         """Model's expected cumulative capacity fade (fraction) for a battery that has
@@ -563,7 +616,9 @@ class DegradationModel:
         arrhenius = math.exp(-self.Ea_cal / (self.R * temp_k)) / math.exp(-self.Ea_cal / (self.R * T_ref))
         fcal = self.calendar_soc_stress(soc_percent / 100.0)
         stress = (fcal - 1.0) if marginal else fcal
-        nominal_cents_per_hour = self.capex / (self.calendar_life_years * 8760.0)
+        # calendar_fade_share apportions the capex so calendar + cycle sum to ONE capex (no
+        # double-count); the calendar mechanism claims only its expected share of the budget.
+        nominal_cents_per_hour = self.capex / (self.calendar_life_years * 8760.0) * self.calendar_fade_share
         return nominal_cents_per_hour * arrhenius * stress * delta_time_hours * self.calibration_factor
 
     def step_wear_cost_cents(self, temp_c, soc_percent, delta_throughput_kwh, delta_time_hours, is_charging, calendar_marginal=True):
