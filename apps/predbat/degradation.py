@@ -169,7 +169,7 @@ class DegradationModel:
     optimiser's decisions.
     """
 
-    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=10000, nominal_c_rate=None, calendar_life_years=15.0, eol_capacity_fade=0.30, average_dod=1.0, expected_cycles_per_year=365.0, calendar_soc_a_max=2.0, calendar_soc_mid=0.72, calendar_soc_k=10.0):
+    def __init__(self, chemistry="LFP", battery_capacity_kwh=24.0, capex=1000000, lifetime_cycles=10000, nominal_c_rate=None, calendar_life_years=15.0, eol_capacity_fade=0.30, average_dod=1.0, expected_cycles_per_year=365.0, calendar_soc_a_max=2.0, calendar_soc_mid=0.72, calendar_soc_k=10.0, fade_cycle_share_override=0.0):
         """Initialise the degradation model.
 
         Args:
@@ -241,6 +241,11 @@ class DegradationModel:
         # Expected real duty (equivalent full cycles/year) used ONLY to apportion the capex
         # budget between calendar and cycle wear (see _compute_fade_shares).
         self.expected_cycles_per_year = expected_cycles_per_year
+        # Manual override for the cycle fade share (0<x<1).  When >0 it REPLACES the
+        # duty-derived split (calendar_share = 1-x).  The duty-derived split is an
+        # engineering allocation, not literature; 0.5 gives a neutral 50/50 until the
+        # split is properly researched / made adaptive from measured throughput.
+        self.fade_cycle_share_override = fade_cycle_share_override
         # Wang 2011: charging/high C-rate REDUCES the effective cycle activation energy
         # (Ea_eff = Ea_cyc - wang_c_rate_coeff * C_rate), a mild WARM C-rate effect, rather
         # than a strong unconditional C^gamma multiplier (Schimpe: ~no warm C-rate effect).
@@ -272,6 +277,11 @@ class DegradationModel:
         two shares sum to 1 and total predicted fade over life == EOL (see budget check).
         Shares scale the absolute cost of each mechanism; relative SoC/temp shapes are kept.
         """
+        # Manual override wins: force the split (e.g. 0.5 = neutral 50/50).
+        if self.fade_cycle_share_override and 0.0 < self.fade_cycle_share_override < 1.0:
+            self.cycle_fade_share = self.fade_cycle_share_override
+            self.calendar_fade_share = 1.0 - self.fade_cycle_share_override
+            return
         cap = max(self.battery_capacity_kwh, 1e-6)
         # annual cycle fade (fraction of EOL) at expected duty
         rated_one_way = max(self.lifetime_cycles * cap, 1e-6)
