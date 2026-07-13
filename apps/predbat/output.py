@@ -1346,10 +1346,15 @@ class Output:
                         temp_c=temp_c, soc_percent=mid_soc,
                         delta_throughput_kwh=abs(soc_change), delta_time_hours=dt_hours, is_charging=is_chg,
                     )
+                # DISPLAY uses FULL physical calendar (marginal=False) so the frontend shows the
+                # true depreciation the pack actually incurs (incl. the unavoidable baseline that
+                # ages with wall-clock time at any SoC).  NOTE: the OPTIMISER still uses the
+                # marginal calendar (baseline cancels between plans), so this displayed wear is
+                # intentionally larger than the decision-relevant wear the planner minimises.
                 cal_c = self.degradation_model.calendar_cost_cents(
-                    temp_c=temp_c, soc_percent=mid_soc, delta_time_hours=dt_hours, marginal=True,
+                    temp_c=temp_c, soc_percent=mid_soc, delta_time_hours=dt_hours, marginal=False,
                 )
-                # cyc_c = cycle-throughput wear, cal_c = marginal calendar (SoC-dwell) wear.
+                # cyc_c = cycle-throughput wear, cal_c = full calendar (time+SoC-dwell) wear.
                 # Rolled into wear_c for the default view; shown split under Show Debug.
                 cyc_c = round(cyc_c, 2)
                 cal_c = round(cal_c, 2)

@@ -1683,6 +1683,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
                     calendar_soc_a_max=self.get_arg("degradation_calendar_soc_a_max", 2.0),
                     calendar_soc_mid=self.get_arg("degradation_calendar_soc_mid", 0.72),
                     calendar_soc_k=self.get_arg("degradation_calendar_soc_k", 10.0),
+                    fade_cycle_share_override=self.get_arg("degradation_fade_cycle_share", 0.0),
                 )
                 # Stage-3 age recalibration factor (auto-derived over time from BMS SoH drift).
                 self.degradation_model.calibration_factor = self.get_arg("degradation_calibration_factor", 1.0)
