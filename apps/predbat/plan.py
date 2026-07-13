@@ -1638,6 +1638,11 @@ class Plan:
                             self.export_limits_best = [100.0 for _i in range(len(self.export_window_best))]
                             self.optimise_all_windows(best_metric, metric_keep)
                             raw_default = _dm_render()
+                            # Snapshot the flat-optimised (predbat-default) plan windows.
+                            _dm_default = (
+                                copy.deepcopy(self.charge_window_best), copy.deepcopy(self.charge_limit_best),
+                                copy.deepcopy(self.export_window_best), copy.deepcopy(self.export_limits_best),
+                            )
                             self.degradation_cost_enable = True
                             self.degrad_plan_rows = raw_default.get("rows", [])
                             self.degrad_plan_totals = raw_default.get("totals", {})
@@ -1649,7 +1654,23 @@ class Plan:
                             self.log("Default-plan comparison: wear-aware cost={:.1f}c wear={:.1f}c cyc={:.2f} | predbat-default cost={:.1f}c wear={:.1f}c cyc={:.2f}".format(
                                 at.get("total_cost", 0) or 0, at.get("wear_c_total", 0) or 0, at.get("battery_cycle", 0) or 0,
                                 dt.get("total_cost", 0) or 0, dt.get("wear_c_total", 0) or 0, dt.get("battery_cycle", 0) or 0))
-                            _dm_set(_dm_exec)
+                            # BEST-OF-BOTH (2026-07-13): the wear-aware region search can converge to a
+                            # WORSE local optimum than the flat search on the SAME money+wear objective
+                            # (e.g. dumping charge into a shoulder instead of holding it for a peak).
+                            # Score BOTH candidate plans under the cost objective (degradation_cost_enable
+                            # is now True) and execute whichever is genuinely cheaper, using the flat plan
+                            # as an extra search seed.  Guarantees the executed plan is never worse than
+                            # predbat's default on our own objective.
+                            self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
+                            active_metric = self.run_prediction_metric(_dm_exec[1], _dm_exec[0], _dm_exec[2], _dm_exec[3], end_record=self.end_record)[0]
+                            default_metric = self.run_prediction_metric(_dm_default[1], _dm_default[0], _dm_default[2], _dm_default[3], end_record=self.end_record)[0]
+                            if default_metric < active_metric - 0.1:
+                                self.log("Best-of-both: adopting DEFAULT plan (unified metric {:.1f} < wear-aware {:.1f}) - wear-aware search hit a worse local optimum".format(default_metric, active_metric))
+                                _dm_chosen = _dm_default
+                            else:
+                                self.log("Best-of-both: keeping wear-aware plan (unified metric {:.1f} <= default {:.1f})".format(active_metric, default_metric))
+                                _dm_chosen = _dm_exec
+                            _dm_set(_dm_chosen)
                             self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
                             self.run_prediction(self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, False, save="best", end_record=self.end_record)
                             self.degradation_last_compare_ts = degrad_now_ts
