@@ -260,6 +260,45 @@ class DegradationModel:
     # Public helpers
     # ------------------------------------------------------------------
 
+    def apply_config(
+        self,
+        battery_capacity_kwh=None,
+        capex=None,
+        lifetime_cycles=None,
+        nominal_c_rate=None,
+        calendar_life_years=None,
+        eol_capacity_fade=None,
+        calendar_contamination=None,
+        marginal_baseline_soc=None,
+        calibration_factor=None,
+    ):
+        """Refresh tunable parameters in place from apps.yaml.
+
+        The model is otherwise built once in ``initialize()``; without this an
+        apps.yaml edit (calibration, baseline SoC, calendar life, ...) would not
+        take effect until a full container restart.  Only tunable cost anchors are
+        touched; the runtime wear accumulators (total_capacity_loss, step_multipliers)
+        are preserved.  ``None`` means "leave unchanged".
+        """
+        if battery_capacity_kwh is not None:
+            self.battery_capacity_kwh = battery_capacity_kwh
+        if capex is not None:
+            self.capex = capex
+        if lifetime_cycles is not None:
+            self.lifetime_cycles = lifetime_cycles
+        if nominal_c_rate and nominal_c_rate > 0:
+            self.nominal_c_rate = nominal_c_rate
+        if calendar_life_years is not None:
+            self.calendar_life_years = calendar_life_years
+        if eol_capacity_fade is not None:
+            self.eol_capacity_fade = eol_capacity_fade
+        if calendar_contamination is not None:
+            self.calendar_contamination = calendar_contamination
+        if marginal_baseline_soc is not None:
+            self.marginal_baseline_soc = marginal_baseline_soc
+        if calibration_factor is not None:
+            self.calibration_factor = calibration_factor
+
     def baseline_cycle_cost(self, average_dod=0.8):
         """Compute the baseline Levelised Cost of Storage (LCOS).
 
