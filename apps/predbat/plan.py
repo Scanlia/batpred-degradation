@@ -1756,7 +1756,23 @@ class Plan:
                             self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10)
                             self.recreate_thread_pool(max_processes=_dm_workers)
                             self.log("Default-plan comparison: optimising predbat-default flat plan ({} workers)".format(_dm_workers))
-                            _dm_set(_dm_exec)
+                            # BUGFIX 2026-07-13: seed the FULL candidate windows (as calculate_plan
+                            # does) instead of the degradation plan's already-pruned windows.
+                            # optimise_all_windows only tunes limits on windows present in
+                            # charge_window_best; reusing _dm_exec (post-discard_unused_charge_slots)
+                            # left the default plan with no/one window to charge into, so it could
+                            # never reproduce stock predbat.  Reseeding from low_rates makes it a
+                            # true fresh default optimise.
+                            if self.low_rates and self.calculate_best_charge and self.set_charge_window:
+                                self.charge_window_best = copy.deepcopy(self.low_rates)
+                            else:
+                                self.charge_window_best = copy.deepcopy(self.charge_window)
+                            if self.calculate_best_export and self.set_export_window:
+                                self.export_window_best = copy.deepcopy(self.high_export_rates)
+                            else:
+                                self.export_window_best = copy.deepcopy(self.export_window)
+                            self.charge_limit_best = [self.current_charge_limit * self.soc_max / 100.0 for _i in range(len(self.charge_window_best))]
+                            self.export_limits_best = [100.0 for _i in range(len(self.export_window_best))]
                             self.optimise_all_windows(best_metric, metric_keep)
                             raw_default = _dm_render()
                             self.degradation_cost_enable = True

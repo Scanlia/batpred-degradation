@@ -1679,13 +1679,19 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
                     nominal_c_rate=self.get_arg("degradation_nominal_c_rate", 0),
                     calendar_life_years=self.get_arg("degradation_calendar_life_years", 15.0),
                     eol_capacity_fade=self.get_arg("degradation_eol_capacity_fade", 0.30),
+                    expected_cycles_per_year=self.get_arg("degradation_expected_cycles_per_year", 365.0),
+                    calendar_soc_a_max=self.get_arg("degradation_calendar_soc_a_max", 2.5),
+                    calendar_soc_mid=self.get_arg("degradation_calendar_soc_mid", 0.78),
+                    calendar_soc_k=self.get_arg("degradation_calendar_soc_k", 12.0),
                 )
                 # Stage-3 age recalibration factor (auto-derived over time from BMS SoH drift).
                 self.degradation_model.calibration_factor = self.get_arg("degradation_calibration_factor", 1.0)
                 self.log(
-                    "Degradation model enabled: chemistry={}, nominal throughput cost={:.3f} c/kWh (two-way), cost_objective={}".format(
+                    "Degradation model enabled: chemistry={}, throughput cost={:.3f} c/kWh two-way, fade split cycle={:.2f}/calendar={:.2f}, cost_objective={}".format(
                         self.degradation_model.chemistry,
                         self.degradation_model.throughput_cycle_cost(),
+                        self.degradation_model.cycle_fade_share,
+                        self.degradation_model.calendar_fade_share,
                         getattr(self, "degradation_cost_enable", False),
                     )
                 )
