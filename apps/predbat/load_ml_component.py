@@ -82,7 +82,7 @@ class LoadMLComponent(ComponentBase):
         self.ml_patience_initial = 10
         self.ml_patience_update = 10
         self.ml_min_days = 1
-        self.ml_validation_threshold = 2.0
+        self.ml_validation_threshold = float(self.get_arg("load_ml_validation_threshold", 2.0))
         self.ml_time_decay_days = 30
         self.ml_max_load_kw = 50.0
         self.ml_max_model_age_hours = 48
