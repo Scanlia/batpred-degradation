@@ -78,9 +78,9 @@ class LoadMLComponent(ComponentBase):
 
         self.ml_learning_rate = 0.001
         self.ml_epochs_initial = 100
-        self.ml_epochs_update = 30
+        self.ml_epochs_update = int(self.get_arg("load_ml_epochs_update", 10))
         self.ml_patience_initial = 10
-        self.ml_patience_update = 10
+        self.ml_patience_update = int(self.get_arg("load_ml_patience_update", 3))
         self.ml_min_days = 1
         self.ml_validation_threshold = float(self.get_arg("load_ml_validation_threshold", 2.0))
         self.ml_time_decay_days = 30
@@ -92,7 +92,7 @@ class LoadMLComponent(ComponentBase):
         # Curriculum learning: expand training window from oldest week forward
         self.ml_curriculum_window_days = 7  # Initial window size in days
         self.ml_curriculum_step_days = 1  # Days added per subsequent pass
-        self.ml_curriculum_max_passes = 4  # Max intermediate passes (0 = no limit)
+        self.ml_curriculum_max_passes = int(self.get_arg("load_ml_curriculum_max_passes", 2))  # Max intermediate passes (0 = no limit)
         self.load_ml_database_days = load_ml_database_days
         self.ml_validation_holdout_hours = 48
         self.run_timeout = 2 * 60 * 60  # 2 hours timeout for the whole run to prevent runaway execution
@@ -980,10 +980,21 @@ class LoadMLComponent(ComponentBase):
         # Lock released - event loop is free during training
 
         try:
+            # train_curriculum() is CPU-bound NumPy (no awaits). Run it in a worker
+            # thread via asyncio.to_thread so the AppDaemon event loop stays responsive
+            # and Predbat keeps completing plan cycles during the retrain (otherwise the
+            # loop freezes for the whole train and predbat.status goes stale -> HA
+            # "offline" alerts). Safe against the fork+BLAS lockup: load_ml_calculating
+            # stays True for the duration, so plan.py disables its multiprocessing pool
+            # and runs single-threaded while we train (plan.py:~1159). Predbat never
+            # reads self.predictor here (load_ml_source drives the plan, not this), and
+            # this coroutine awaits the training before its own predict, so nothing
+            # touches the model concurrently.
             if is_initial:
                 # Curriculum: progressively expand the training window from oldest week
                 # forward so the model learns gradually from historical structure.
-                val_mae = self.predictor.train_curriculum(
+                val_mae = await asyncio.to_thread(
+                    self.predictor.train_curriculum,
                     load_data_snap,
                     now_utc_snap,
                     pv_minutes=pv_data_snap,
