@@ -2901,7 +2901,7 @@ class Fetch:
         self.battery_rate_max_scaling = self.get_arg("battery_rate_max_scaling")
         self.battery_rate_max_scaling_discharge = self.get_arg("battery_rate_max_scaling_discharge")
 
-        self.best_soc_step = 0.25
+        self.best_soc_step = float(self.get_arg("best_soc_step", 0.1))  # SoC-target search resolution (kWh); stock 0.25, we run 0.1 (floored at 0.1 in plan.py) for finer plans now the C++ kernel makes them ~instant
         self.metric_cloud_enable = self.get_arg("metric_cloud_enable")
         self.metric_load_divergence_enable = self.get_arg("metric_load_divergence_enable")
 
